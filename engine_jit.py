@@ -25,13 +25,12 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        x = batch["tensors"][0].to(device, non_blocking=True) # selecting I0 only
+        labels = torch.zeros(x.size(0), dtype=torch.long, device=device)
         # per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-        # normalize image to [-1, 1]
-        x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
-        x = x * 2.0 - 1.0
         labels = labels.to(device, non_blocking=True)
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):

@@ -1,0 +1,341 @@
+seed_everything: 21
+
+model:
+  weather_dropout: True
+  initial_dropout: True
+  ref_dropout: True
+  sample_steps: 20
+  weather_channels: 55
+  weather_encoder_cnn: false
+  viewshed_radius: 8000
+  cond_channels: 2048
+  latent_dim: 64
+  model: "unet"
+  channel_multipliers:
+    - 1
+    - 2
+    - 2
+    - 4
+
+optimizer:
+  class_path: torch.optim.AdamW
+  init_args:
+    lr: 1e-4
+
+trainer:
+  accelerator: gpu
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        enable_version_counter: false
+        filename: '{epoch:02d}'
+        every_n_epochs: 5
+        save_on_exception: true
+        save_top_k: -1
+    - class_path: pytorch_lightning.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: photocast.utils.ema.PowerWeightAveraging
+      init_args:
+        std1: 0.05
+        std2: 0.1
+  devices:
+  - 0
+  enable_progress_bar: true
+  limit_train_batches: 16384
+  limit_val_batches: 16
+  log_every_n_steps: 250
+  logger:
+    class_path: pytorch_lightning.loggers.WandbLogger
+    init_args:
+      name: demo
+      save_dir: ./runs/wandb/photocast
+      version: null
+  max_epochs: 20
+  precision: bf16-mixed
+
+data:
+  lead_times: 
+    - 60
+    - 60
+  batch_size: 128
+  eval_size:
+  - 128
+  - 1024
+  image_root_dir: ./photocast_data
+  img_size:
+  - 256
+  - 256
+  num_workers: 1
+  viewshed_radius: 8000
+  train:
+  - d9be9239aa3d708b8e25601445937eed
+  - 651b0655744f96a67d318fac69e44986
+  - 97e8cb606dfd741bbfd1f018f9db1b4c
+  # - 2a47750c694dcb3cedb8a42a94661c36
+  # - 2d82051f049f17bf0876ad42d2da1912
+  # - be41fd9e72c7b86acf57f07968440365
+  # - 369b8466639779235563e79e2f83dd50
+  # - 8989932c38d693b067f00aa335b042ad
+  # - b0d999fa841b1268b39d7ac825ba4aa2
+  # - aecad178a385341c23c9c2f9b4113ecc
+  # - 973478c91b7b426981ea9278bb2e6d68
+  # - 3c8cf82640ed59cff39849ff443d227c
+  # - fb191748691dc406ed574d2b079591e0
+  # - 6f62158e17f9dea3b7e48167e3aeb87c
+  # - 3f460408ade1f3bc47e1b91e36923152
+  # - 0760000922782fd6ab9c2f5acef9a3f6
+  # - 41f1e71811c6c1443d3e582f480005b9
+  # - dc922bf649a49254c3fcb717d805448d
+  # - 527f953c3776c0552355d4a154c2b4e8
+  # - fdfde5d934363bb0f748ed36a38a4428
+  # - 0cc914a67f9ebe6996473ac614a37080
+  # - c892c9cb5f080a48eee665a9e1c417f6
+  # - 0a1bed9a563491a00b7c14ff331e9635
+  # - a0d3ac616e741637e5c22759d316f4fe
+  # - 03ecfaa0ae031f4cde43a2253298d95d
+  # - b707198b33fa2241df3f26e35eaa1be6
+  # - c148acc1d46b17e2487160bbb9e6a55c
+  # - cb8bd98d6d05de26c705f899bc6301f8
+  # - 409bc29c520a6dfe89adf1f4e2ff4421
+  # - 94fae0fb35a78e59ece75cf646cc24d5
+  # - 5cabbeb720c5e2653aa86f8cf10551ec
+  # - 475c0c9eb426577ad7dd1744a13b9e85
+  # - 877919abdb23eb59f63908ab8b300f1f
+  # - f43fa34b521e9ad69b7d81fbb9cc7ffd
+  # - 5f900fdc93d5198e0f30062022c48231
+  # - 5b5e2a9f6208401ca8e876c90e8a23d6
+  # - a07cda06eab3fa5b142729ba7dcfa199
+  # - fd3c1f2e7ce6532ea68449b15d415146
+  # - 8cf1456c9f2248e680b1cf62881fed5g
+  # - 9f5c4a6810e1f9d7deed9624a370bd2a
+  # - 890711de5b938a4fd4d6003559d912e5
+  # - a3eba3e015d6c90ea9af04ffab3bb144
+  # - 1bfc4bc105339f78d10ef4de9215137e
+  # - 5140108205a82a0fd7f320257ca4e700
+  # - 22c10c377d36edaccd4094a8faf78f17
+  # - b6776a9a6304f02b4252425e836c13a8
+  # - a2e32a7f1341eaa24165bd428df11807
+  # - 2a5c721dd3ab7b7fc1d5a697193d8426
+  # - 93f3c4f8f3fae5dbe3c2be1295032589
+  # - abfbdeac9a9aa0cba2f93ce5d094d2e0
+  # - 75d2c47bd00b9177189bd3f1fb6ff6ed
+  # - d0ca778cb2da2bde5ea3029d8ce88e12
+  # - 13dd2b2ccb33eaf73f5e71b7c0dee6be
+  # - e82e8c6558d1c6afdb58b7d32e82e8dd
+  # - bb1bef18635913b888fda1d13ddcde56
+  # - 030ee68c2b79d9ed086c9acbd88e5851
+  # - 7823d0baddb829dad0ccc55bf912afe7
+  # - 86c279415a96ab5c84d9688d1ad88cc1
+  # - 584c8f65bd7b360eed6ffd43226cca8a
+  # - 665821f6b3efa91817dcf4bf55126fd8
+  # - 77766a9538657dac046ec29847285e76
+  # - 4d9e6fcd57e3cb14fe96612bd24523dd
+  # - 0f98b0b18a7966340b8a9d58ee5c3666
+  # - 1fc242608f19c49706c5a093c412141d
+  # - 062aa22ef74dd60a1d76e69e1bf0d38a
+  # - a0d03c62fc1967da2efd84d59e1e3c25
+  # - 4a277fe40f07aad96a10401da6eb885a
+  # - 0377cad1b02b16350bbf961fa11080d2
+  # - 19c0abc737ea292ff089a132866eaee1
+  # - 1c7a42ca740d0ebf4f131484c11a3391
+  # - 2adb5f12b209ff9ee5a13bf844061d41
+  # - 3db2462abc375b4b6099f1d00cf583f5
+  # - b9eae9b501e0f3e3fb4f560bf435f702
+  # - 991f8e4609c334b2ae2077d2e2602d60
+  # - 5b68a08ee9283bf5204772b0f43c5d32
+  # - 1be90ee9feae91ceaebe38c2339d2040
+  # - dff73f10cb88365b23820543036bd394
+  # - 16ec41f3efad89e9368fa60d69f77319
+  # - 470720e1312844b26b2720368f427cd8
+  # - 7ce62e65f5877e720fe8f70dde97cb2d
+  # - 25203f3c4f377f39d43ff172dc021e85
+  # - d27896b3baf94ff91ab9c756f70efba6
+  # - f716fb947d2478c53314f85aa3370068
+  # - ab92ab2d9210a3adce2dafc9bd6fe35f
+  # - 395dba9d37da273869dd7eeaa7ae82ee
+  # - df54c82d03f9ce7a98eb3fe8d9ffdb63
+  # - 8edaaed759fac1c674f1525ed77e05b7
+  # - b96f6e9d826c8ca461aaa5067fc4a237
+  # - d99e05645dc338ab9b89b39e2467631e
+  # - c8000fa415294bbb6b2d665bf6f9c450
+  # - bbcc76cbb36b86a55688affe1151522b
+  # - 0ef5c044eeefd9923846df991f8cb14a
+  # - 0798c8309d3948c472306b53be3bc531
+  # - 50d0c74ef77d0815c4d5112a4f6251b3
+  # - e08c6e0ae4563456d35cd1da7742b76c
+  # - 7e7ce6cf92bcfa8ffde4f1c99d93dbdd
+  # - f61943996d2ca2f3362c4bcae233c11e
+  # - 80df476b5184769856c7b2b9bc8ba991
+  # - f4a10dfc6a359b8312cbc031043cf2f8
+  # - ba585c4f3ccca5e6d4745cfde38a675e
+  # - a10d41d1ebc8ba88081f2edbf43dff0b
+  # - cd7bd18a468248bbfad957ce07f5a82a
+  # - 96e5b2173139edb8e7a84962bc61655c
+  # - e1a18c70c2edd104c6ec2cd12e18bd84
+  # - e686eacea6ff5cab389ceed480a6a81f
+  # - bda99010800ee87aaef2599e31b3b8fc
+  # - 76446e713a54b19d33959f30a2ae3795
+  # - be37ba992d9cdc9ce952d0e699b726c2
+  # - 6e5daeb566db2c0f6e19032a5819b02c
+  # - dabc24d935563150317c7f013487801b
+  # - d3f581c58ffa47ab726da0afb7d31f16
+  # - a7d6f82f384dc3c35e7ec419d2dbdd37
+  # - a37703dc2d8220f41e4505b30ea0268e
+  # - 9dfe40a1419352bf90c0df14ae9501d7
+  # - a735ee7a08bd1054bb466abb55552c8e
+  # - f94fedfd4894aa1f886b2e363142d223
+  # - b90717d45c000856c0f937dd3060b624
+  # - 99f68dd5bb856ea9ca41dca4d7d0176d
+  # - 0e728239ee1d68e744a63747860b5dfb
+  # - 68faccc276f19fc6a37bec4225a061d4
+  # - dcd62f5185ebe99b571c480cfe1ce83c
+  # - 50eb2ce1df570ff373f38eb53f47d963
+  # - f06edd0e4ec0fc4c818f8be6cd6b23bb
+  # - cab97a37b7320095c03b0fd3f85faa0f
+  # - f5ed3da10e357c11e7eef5075fedada2
+  # - e9f8a39dca2b7ac0950baab577dbc2dc
+  # - 9785c38dc6b4be0eba0d0415e1b8ebd8
+  # - 7f747e55453529b3c6e80e332b3fe630
+  # - c938a8cb046332a53e7576d95f81c4c0
+  # - 0bbec2448ae21b50011f90b1795a6945
+  # - 6c90e2bb67751d481f92e92f8c18db03
+  # - fbd52e937aadf27b52ab1cfba197fe9b
+  # - 363fb9b862b398b21696a7a684b76270
+  # - d479c4cb9de3e0afda1ead556edaf851
+  # - 61bad84de092008b3c26d785d1093b1b
+  # - 9c7ca8cf918c4aeb05e552e1151d660d
+  # - b47569138e111706fcba8d747b82451a
+  # - 4f92d35c5d7b54c04b93182af31d9d1a
+  # - 7773fef00c5ca6689012b8a14b120fa9
+  # - 9ed587d462ac301f7167a69e0bf87119
+  # - c24045ae3ba0a2c16eb4f1466c2ec10f
+  # - 13d08d569ebb4606130a6cb625b2d036
+  # - 26fbf7c370327b0b07f0349fcc2d26cd
+  # - e98d8941c2c4b755396825af12374496
+  # - 7719977da09fa9bceb1d70a106b67164
+  # - 7ad6fa55fb56f560fe26c5d7cf13a6fa
+  # - 4a3f395ba9454e649d686b03723d70fd
+  # - dbb5da2713c66505f2004b60c6c56609
+  # - ed8ba650599cbb5afb117f363960a5c6
+  # - a1ce6f84470952a1b7a4e5af98c50cf8
+  # - c2f9e6ae46be1e54e574fe3a6572f176
+  # - 5ae8c9efd33488f02592f15c8540b813
+  # - abc4ee68c2c79d3ed086c9acdd82e5831
+  # - 9d9bc131d34da70474ef041176c2b102
+  # - 972c367c02abe6b68f40d9ccf126c048
+  # - 56e5e551c7a36cff8e8c3df5f9f4375e
+  # - aa0c6280130cfab16f1f99cb6b9f41f9
+  # - d90639783506146c1e4307a0e57b3c61
+  # - 0ecc3a0d4640fe8446d1da12e70d6232
+  # - 63ecc8ef202712595c445031729e761e
+  # - 08465330b5d10e772a958a0f351cb83f
+  # - 41daa5352a35a0e60ef765e521ac05b8
+  # - d636f1f375860e390eaf3f9ce52938e5
+  # - eba943ecbd06eaa835c4e5c948741534
+  # - 1198ccc32f6b209780f2d402babf7ad6
+  # - f28a2aaab9c3a968e8fad16ae897fc48
+  # - 166cab66d87ffb78bb8b3851f0e8a243
+  # - f1fa9308b5d7f9add31755a7523b27ef
+  # - 360087677a83ba5791a7d67ad2ad9af8
+  # - 28a63fc5e6b4991e7fa37cfb19687184
+  # - 365cfe9f2f22251af9ed1a18ce492857
+  # - d2c19d7129890e581ecd3d49e49acd82
+  # - d533d9a207ddf12b38843b7b2faaa322
+  # - 86612ec15ac74366ed4d23a9a7cbd7cf
+  # - adab77b14a5e6558eb223ee694f4bce4
+  # - d54b34267ac75e2913f438e7614c2f6b
+  # - b1e1563b6ddd16e18ade61c3a779bd75
+  # - 7185641cbcd6c675d883207e43bca945
+  # - ee1234946ba22f83a282ad93b3249804
+  # - e2d90a6077d4815a1c537d25c19080c3
+  # - b9fa31cc76c372db790bbb20d6e292f7
+  # - dfdeb5699ce47c7cfa426c1a6736bca8
+  # - 41708533a7b79c9baa44218b42c3f084
+  # - a99f60b63c204b9530e60f6013f39eec
+  # - a295712845effaeb22d20e91c26bb229
+  # - 638ec1025c25202073e12f11dbc49c45
+  # - cfb2594120f75a1b70f6fb845493126b
+  # - e336136657be1223966c6741426939e5
+  # - 38087330b8d80e3f93e8d017e841e59a
+  # - a1d6e08750720ca0b01c3b1f36f7cc28
+  # - a869f88d49fcd090c5a8e9152b68c1bf
+  # - 9eac522f6c3609829b55c97cf50415aa
+  # - c270cf8bd392d14354da2413c38c1b27
+  # - 160828218da03a318a260ed103f3508e
+  # - 7fdadf5a565495fdd9be8ba27d0f58ba
+  # - 0a44ccbebbf9db3db2a90d40eb524440
+  # - c7f0edeec13d52b6c3cf91485d982548
+  # - 93793b6bf0b8d8b3dc2f1b3ad36fd973
+  # - 1bb71faa4346ca8d2ad3d882f0bad0e2
+  # - 468600320b807253c34a32e7d39de983
+  # - 91fdd703112f8738208b5313cb70a18f
+  # - 7b84bf4c0df48991624959d2b9d5aebd
+  # - b2fa9545e778d1bde2ac28e8ddca65b7
+  # - 738cb178044c89590045c15ec2bf2726
+  # - 43987b7e736a3427c4c9747288e6309b
+  # - c3adac37264f5daeb2b750022b975275
+  # - 231fe500e92b21cef9efa925e3320215
+  # - 0f6603494504f065172e9254113ff9e5
+  # - be379b056391760326dde72f9ff36afe
+  # - b03b73b826d0488d5672727478bb8034
+  # - 10c2f99ed616664f01e657d79ed52b52
+  # - ae7511775e423d9e1607406c827a6423
+  # - dd60e715a226d2ffd861c788c23581ea
+  # - 8bce66c4fa1ee5fd13937efebfca57e7
+  # - c1bf032d1c16a4db09e28c31c6b031b4
+  # - 94c4e7fc06529fe4c56a1f96daa7663a
+  # - 9f9fdb73fc9c671aa8edc2ea35427587
+  # - 7cf7018b64c5dd78b205aab95571ed7e
+  # - ced9dd40d34a42d5d43763153b8f35ab
+  # - 08737b8d6b9321b60ec245a02ef4b79b
+  # - a6d5fca5d3624eb04cf9ecc48d5ec7d4
+  # - a11269e1a6467827804a2b9b376f8a4d
+  # - 588a2da6a314a92c26e6d772243b4cd4
+  # - 8cf1456c9a2248e590b1cf62881fed4f
+  # - 7be2ba802dc59d288173beb84cc02955
+  # - f4406cdad80c1cf096c88bf163123cb8
+  # - 189f43afb24260c812e691fb34d40338
+  # - ea43d59e26d6e293a2d99373d69cdd72
+  # - 1e76ad61fe7f753d74370cde5a0e7848
+  # - 02ac55fd0ae01a5155d3ad35f26ae693
+  # - f10ca4622f7700af2f06cebd8c1aa919
+  # - 4e59c3a1052e44ff7609d6ae1194a4d8
+  # - 44611f418e5acdc51beb0765e033ba5c
+  # - 0d4e5c648475b5782417e25582de00f7
+  # - cc437c150166d8e975a2b1674718facb
+  # - c5cdd7eb8249032f90200d0b50c5a7af
+  # - 7422bee4a390166389bc2b31a99835f3
+  # - 65ef340a6d9d199e5aff62cb985557d6
+  # - b47b624ae5292a78b9b32bc2f16f04e3
+  # - fd56136d7de2ef48cb6f2c39df8d0e98
+  # - c583a558ce8ba0d2c90dde6ac92d8d65
+  # - 9e425745e5de8732e6417c934111cb09
+  # - e59dae9f95bebd82da1e3e29c71cb773
+  # - 925f3a4d190c56efef89993342ad9e81
+  # - 0b104156c32f05e194fe0ce8f8132272
+  # - 97bd2a5775cffef2bf0b7df3237cf567
+  # - beabc9f0a0300ebf4d4950a6e2a2454a
+  # - 5c254d5efc0783c052c74cb6f2d374d1
+  # - 99c41c76e560691ab9dd7fbb0d182fac
+  # - 5743ce5fa2811e3e96c7feb9beec1ec7
+  # - 38929e2f8b143665e2d89e2f743b5058
+  # - 8a45746e35185b80c3de9f290e19ae01
+  # - 93567d56915898fe40d80a67f0058567
+  # - 063d0d52860256305c2970188a50266e
+  # - 41458b07cbbfa020ac5f65d5ed0dda5e
+  # - 97d853e94fd3c81760d2c75332bc2b0c
+  # - 81b7fba18c109eba003bb9e58ad7aca8
+  # - 034de41e47b30dde0362b86b42d9fb61
+  # - 00bf7ecb62de2b844241a96bb8c6641e
+  # - 02ac55fd0ae01a5133d3ad35f267e693
+  # - da0fb9b30d66282b56b49e439091f8f0
+  # - ec90ceddc95fd7e6d27c09cef8bef7de
+  # - f3577f44533fdba05cb248586349cc35
+  # - 28dc388b9c6120b2d4ee99c3df37e391
+  val:
+  - 36dc892b7631251c7d2806c848acdade
+  - a67b83fba67bd549f6e7351d9a8ddece
+  - 91e60d49c99ebd99bc13590ba2a500ec
+
+  weather_root_dir: ./data/weather/inca

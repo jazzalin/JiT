@@ -18,6 +18,8 @@ import copy
 from engine_jit import train_one_epoch, evaluate
 
 from denoiser import Denoiser
+import yaml
+from photocast_dataloader import get_photocast_dataloader
 
 
 def get_args_parser():
@@ -88,7 +90,8 @@ def get_args_parser():
     # dataset
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
                         help='Path to the dataset')
-    parser.add_argument('--class_num', default=1000, type=int)
+    parser.add_argument('--class_num', default=1, type=int)
+    parser.add_argument('--config', type=str, default="config.yml")
 
     # checkpointing
     parser.add_argument('--output_dir', default='./output_dir',
@@ -117,6 +120,9 @@ def main(args):
     print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
     print("Arguments:\n{}".format(args).replace(', ', ',\n'))
 
+    with open(args.config, "r", encoding="utf-8") as fid:
+        config = yaml.safe_load(fid)
+
     device = torch.device(args.device)
 
     # Set seeds for reproducibility
@@ -136,15 +142,7 @@ def main(args):
     else:
         log_writer = None
 
-    # Data augmentation transforms
-    transform_train = transforms.Compose([
-        transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.PILToTensor()
-    ])
-
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
+    dataset_train = get_photocast_dataloader(config)
 
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
@@ -155,6 +153,8 @@ def main(args):
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        persistent_workers=True,
+        prefetch_factor=4,
         pin_memory=args.pin_mem,
         drop_last=True
     )

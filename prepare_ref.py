@@ -1,35 +1,38 @@
 import os
 import argparse
-from torchvision import transforms, datasets
+import yaml
+import torch
+from torchvision import transforms
 from torch.utils.data import DataLoader
-from util.crop import center_crop_arr
+from photocast_dataloader import get_photocast_dataloader
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, required=True,
-                        help='Path to ImageNet root directory')
-    parser.add_argument('--output_path', type=str, default='imagenet-train-256',
+    parser.add_argument('--config', type=str, default="config.yml",
+                        help='Config file with the photocast data settings')
+    parser.add_argument('--output_path', type=str, default='photocast-train-256',
                         help='Folder where transformed images will be saved')
-    parser.add_argument('--img_size', type=int, default=256,
-                        help='Resolution to center-crop and resize')
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--num_workers', type=int, default=12)
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Seed for the random panorama crops (makes the reference set reproducible)')
     args = parser.parse_args()
 
-    transform_train = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
-        transforms.CenterCrop(args.img_size),
-        transforms.ToTensor(),
-    ])
+    with open(args.config, "r", encoding="utf-8") as fid:
+        config = yaml.safe_load(fid)
 
-    dataset_train = datasets.ImageFolder(
-        os.path.join(args.data_path, 'train'),
-        transform=transform_train
-    )
+    # Same dataset and transforms as training (random panorama crops, normalized to [-1, 1])
+    dataset_train = get_photocast_dataloader(config)
+    print(dataset_train)
+
+    # Seeding before creating the loader also fixes the worker seeds, so the crops are reproducible
+    torch.manual_seed(args.seed)
 
     data_loader = DataLoader(
         dataset_train,
-        batch_size=256,
-        num_workers=32,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
         shuffle=False,
         pin_memory=False
     )
@@ -40,7 +43,9 @@ def main():
     global_idx = 0
 
     from tqdm import tqdm
-    for batch_images, batch_labels in tqdm(data_loader):
+    for batch in tqdm(data_loader):
+        # undo normalization: [-1, 1] -> uint8 [0, 255]
+        batch_images = ((batch["tensors"] + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
         for i in range(batch_images.size(0)):
             img_tensor = batch_images[i]
 
@@ -52,9 +57,7 @@ def main():
             pil_img.save(out_path, format='PNG', compress_level=0)
             global_idx += 1
 
-        print(f"Saved batch up to index={global_idx} ...")
-
-    print("Finished saving all images.")
+    print(f"Finished saving {global_idx} images.")
 
 
 if __name__ == "__main__":
