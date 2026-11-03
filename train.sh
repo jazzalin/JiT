@@ -5,12 +5,11 @@ main_jit.py \
 --model JiT-B/16 \
 --proj_dropout 0.0 \
 --P_mean -0.8 --P_std 0.8 \
---class_num 1 \
 --online_eval --skip_fid --eval_freq 1 \
---num_images 16 --gen_bsz 16 --grid_size 16 --sample_ema 2 \
+--num_images 16 --gen_bsz 16 --grid_size 16 --preview_classes 4 --sample_ema 2 \
 --img_size 256 --noise_scale 1.0 \
 --batch_size 128 --blr 5e-5 \
 --epochs 200 --warmup_epochs 5 \
---cfg 1.0 --interval_min 1.0 --interval_max 1.0 \
---output_dir ./results/jit --resume ./results/jit \
+--cfg 2.0 --interval_min 0.0 --interval_max 1.0 \
+--output_dir ./results/jit_cam --resume ./results/jit_cam \
 --data_path ./data --online_eval

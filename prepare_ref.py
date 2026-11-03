@@ -45,7 +45,7 @@ def main():
     from tqdm import tqdm
     for batch in tqdm(data_loader):
         # undo normalization: [-1, 1] -> uint8 [0, 255]
-        batch_images = ((batch["tensors"] + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
+        batch_images = ((batch["tensors"][0] + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
         for i in range(batch_images.size(0)):
             img_tensor = batch_images[i]
 

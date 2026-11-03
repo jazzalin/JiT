@@ -164,11 +164,13 @@ class Photocast2DDataset(Dataset):
     def __init__(self,
                  csv_file,
                  image_root_dir,
-                 img_transform=None):
+                 img_transform=None,
+                 label=0):
         """
         Args:
             csv_file: Contains information on the timesteps available for training
             image_root_dir: root directory for panorama images
+            label: class id returned with every sample (camera index for class-conditional training)
             weather_root_dir: root directory for 2D weather fields in netcdf format
             dem_file: an path to a netcdf file containing a DEM variable covering the area of interest
             weather_scaler_file: path to npz file containing mean and std for weather normalization
@@ -187,6 +189,7 @@ class Photocast2DDataset(Dataset):
         self.data["rowid"] = pd.RangeIndex(len(self.data))
 
         self.image_root_dir = image_root_dir
+        self.label = label
 
         self.img_transform = img_transform
         self.tf_expand = PanoramaExpand(angle=self.data["angle"].iloc[0])
@@ -217,7 +220,7 @@ class Photocast2DDataset(Dataset):
 
         sample = {}
         sample["tensors"] = (I0,)
-        sample["labels"] = 0 # dummy
+        sample["labels"] = self.label
         sample["view"] = self.data["cam"].iloc[0]
 
         return sample
@@ -228,26 +231,35 @@ def get_photocast_dataloader(cfg):
 
     transforms = v2.Compose([
         v2.Resize(cfg['data']['img_size'][0], interpolation=v2.InterpolationMode.BICUBIC),
-        PanoramaRandomCrop(cfg['data']['img_size']),
+        # fixed crop at the panorama center, i.e. the North-facing view after PanoramaNorthRoll
+        v2.CenterCrop(cfg['data']['img_size']),
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
     datasets = []
+    cameras = []
 
-    for camera in tqdm(cfg["data"]["train"], "Loading training data"):  
+    for camera in tqdm(cfg["data"]["train"], "Loading training data"):
 
-        try:    
+        try:
             datasets.append(
                 Photocast2DDataset(csv_file=os.path.join(cfg['data']['image_root_dir'], "images", "2026-09-24_train_cams", f"{camera}.csv"),
                                     image_root_dir=cfg['data']["image_root_dir"],
-                                    img_transform=transforms)
+                                    img_transform=transforms,
+                                    label=len(cameras))
             )
+            cameras.append(camera)
         except IndexError as e:
             print(f"Error loading dataset for camera {camera}: {e}")
             continue
 
     dataset = torch.utils.data.ConcatDataset(datasets)
+    # class id i <-> cameras[i]; only cameras that loaded get an id, so ids are contiguous
+    dataset.cameras = cameras
+    print(f"Loaded {len(cameras)}/{len(cfg['data']['train'])} cameras, {len(dataset)} images")
+    for camera, d in zip(cameras, datasets):
+        print(f"  class {d.label:3d}  {camera}  {len(d)} images")
 
     return dataset
     

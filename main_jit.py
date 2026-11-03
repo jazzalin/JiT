@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import json
 import numpy as np
 import os
 import time
@@ -90,6 +91,8 @@ def get_args_parser():
                         help='Only save generated images and a sample grid, skip FID/IS computation')
     parser.add_argument('--grid_size', type=int, default=16,
                         help='Number of generated images in the logged sample grid')
+    parser.add_argument('--preview_classes', type=int, default=4,
+                        help='With --skip_fid: number of cameras (evenly spaced class ids) shown in the preview, one grid row each')
     parser.add_argument('--sample_ema', type=str, default='1', choices=['1', '2', 'none'],
                         help='Weights used for generation: ema_params1, ema_params2 or the raw (non-EMA) weights')
 
@@ -149,6 +152,14 @@ def main(args):
         log_writer = None
 
     dataset_train = get_photocast_dataloader(config)
+
+    # one class per camera that actually loaded; overrides --class_num so the label embedding always matches the data
+    if args.class_num != len(dataset_train.cameras):
+        print("Setting class_num to {} (number of loaded cameras, was {})".format(len(dataset_train.cameras), args.class_num))
+    args.class_num = len(dataset_train.cameras)
+    if global_rank == 0 and args.output_dir:
+        with open(os.path.join(args.output_dir, "cameras.json"), "w") as f:
+            json.dump(dataset_train.cameras, f, indent=2)
 
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True

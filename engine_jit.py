@@ -28,7 +28,7 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         x = batch["tensors"][0].to(device, non_blocking=True) # selecting I0 only
-        labels = torch.zeros(x.size(0), dtype=torch.long, device=device)
+        labels = batch["labels"]  # camera index
         # per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
@@ -97,8 +97,17 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
     # ensure that the number of images per class is equal.
     class_num = args.class_num
-    assert args.num_images % class_num == 0, "Number of images per class must be the same"
-    class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
+    if args.skip_fid:
+        # preview: a few evenly spaced cameras, consecutive images per camera so each grid row is one camera
+        preview_classes = np.unique(np.linspace(0, class_num - 1, min(args.preview_classes, class_num)).round().astype(int))
+        assert args.num_images % len(preview_classes) == 0, "num_images must be a multiple of the number of preview cameras"
+        images_per_class = args.num_images // len(preview_classes)
+        class_label_gen_world = preview_classes.repeat(images_per_class)
+        print("Preview class ids:", preview_classes.tolist())
+    else:
+        assert args.num_images % class_num == 0, "Number of images per class must be the same"
+        images_per_class = None
+        class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
     class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
 
     grid_images = []
@@ -141,7 +150,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
     # sample grid from rank 0, saved next to the image folder so it survives the FID cleanup
     if misc.is_main_process() and len(grid_images) > 0:
-        grid = torchvision.utils.make_grid(grid_images, nrow=math.ceil(math.sqrt(len(grid_images))), padding=2)
+        nrow = images_per_class if images_per_class is not None else math.ceil(math.sqrt(len(grid_images)))
+        grid = torchvision.utils.make_grid(grid_images, nrow=nrow, padding=2)
         torchvision.utils.save_image(grid, save_folder + "-grid.png")
         if log_writer is not None:
             log_writer.add_image('samples', grid, epoch)
