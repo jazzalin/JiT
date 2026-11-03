@@ -227,7 +227,7 @@ def get_photocast_dataloader(cfg):
     """
 
     transforms = v2.Compose([
-        v2.Resize(cfg['data']['img_size'], interpolation=v2.InterpolationMode.BICUBIC),
+        v2.Resize(cfg['data']['img_size'][0], interpolation=v2.InterpolationMode.BICUBIC),
         PanoramaRandomCrop(cfg['data']['img_size']),
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))

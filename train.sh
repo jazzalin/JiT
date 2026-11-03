@@ -12,5 +12,5 @@ main_jit.py \
 --batch_size 128 --blr 5e-5 \
 --epochs 200 --warmup_epochs 5 \
 --cfg 1.0 --interval_min 1.0 --interval_max 1.0 \
---output_dir ./results --resume ./results \
+--output_dir ./results/jit --resume ./results/jit \
 --data_path ./data --online_eval
