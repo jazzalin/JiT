@@ -90,6 +90,8 @@ def get_args_parser():
                         help='Only save generated images and a sample grid, skip FID/IS computation')
     parser.add_argument('--grid_size', type=int, default=16,
                         help='Number of generated images in the logged sample grid')
+    parser.add_argument('--sample_ema', type=str, default='1', choices=['1', '2', 'none'],
+                        help='Weights used for generation: ema_params1, ema_params2 or the raw (non-EMA) weights')
 
     # dataset
     parser.add_argument('--data_path', default='./data/imagenet', type=str,

@@ -74,23 +74,26 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     # Construct the folder name for saving generated images.
     save_folder = os.path.join(
         args.output_dir,
-        "{}-steps{}-cfg{}-interval{}-{}-image{}-res{}-epoch{:03d}".format(
+        "{}-steps{}-cfg{}-interval{}-{}-image{}-res{}-ema{}-epoch{:03d}".format(
             model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale,
-            model_without_ddp.cfg_interval[0], model_without_ddp.cfg_interval[1], args.num_images, args.img_size, epoch
+            model_without_ddp.cfg_interval[0], model_without_ddp.cfg_interval[1], args.num_images, args.img_size,
+            args.sample_ema, epoch
         )
     )
     print("Save to:", save_folder)
     if misc.get_rank() == 0 and not os.path.exists(save_folder):
         os.makedirs(save_folder)
 
-    # switch to ema params, hard-coded to be the first one
+    # switch to the ema params selected by --sample_ema ("none" keeps the raw weights)
     model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
-    ema_state_dict = copy.deepcopy(model_without_ddp.state_dict())
-    for i, (name, _value) in enumerate(model_without_ddp.named_parameters()):
-        assert name in ema_state_dict
-        ema_state_dict[name] = model_without_ddp.ema_params1[i]
-    print("Switch to ema")
-    model_without_ddp.load_state_dict(ema_state_dict)
+    if args.sample_ema != "none":
+        ema_params = model_without_ddp.ema_params1 if args.sample_ema == "1" else model_without_ddp.ema_params2
+        ema_state_dict = copy.deepcopy(model_without_ddp.state_dict())
+        for i, (name, _value) in enumerate(model_without_ddp.named_parameters()):
+            assert name in ema_state_dict
+            ema_state_dict[name] = ema_params[i]
+        print("Switch to ema{}".format(args.sample_ema))
+        model_without_ddp.load_state_dict(ema_state_dict)
 
     # ensure that the number of images per class is equal.
     class_num = args.class_num
