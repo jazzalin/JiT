@@ -14,6 +14,7 @@ import torchvision.datasets as datasets
 
 from util.crop import center_crop_arr
 import util.misc as misc
+from util.sampler import RandomSubsetSampler
 
 import copy
 from engine_jit import train_one_epoch, evaluate
@@ -35,6 +36,8 @@ def get_args_parser():
 
     # training
     parser.add_argument('--epochs', default=200, type=int)
+    parser.add_argument('--steps_per_epoch', default=0, type=int,
+                        help='If > 0, each epoch is this many steps on a fresh random subset of the data (0 = full pass)')
     parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
                         help='Epochs to warm up LR')
     parser.add_argument('--batch_size', default=128, type=int,
@@ -161,9 +164,16 @@ def main(args):
         with open(os.path.join(args.output_dir, "cameras.json"), "w") as f:
             json.dump(dataset_train.cameras, f, indent=2)
 
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    )
+    if args.steps_per_epoch > 0:
+        # fixed-length epochs: a new random subset of steps_per_epoch batches per GPU each epoch
+        sampler_train = RandomSubsetSampler(
+            dataset_train, num_samples=args.steps_per_epoch * args.batch_size,
+            num_replicas=num_tasks, rank=global_rank, seed=args.seed
+        )
+    else:
+        sampler_train = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+        )
     print("Sampler_train =", sampler_train)
 
     data_loader_train = torch.utils.data.DataLoader(
@@ -239,8 +249,8 @@ def main(args):
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
+        # both samplers reshuffle per epoch only through set_epoch, so call it even on a single GPU
+        data_loader_train.sampler.set_epoch(epoch)
 
         train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
 
@@ -254,7 +264,7 @@ def main(args):
                 epoch_name="last"
             )
 
-        if epoch % 100 == 0 and epoch > 0:
+        if epoch % 10 == 0 and epoch > 0:
             misc.save_model(
                 args=args,
                 model_without_ddp=model_without_ddp,

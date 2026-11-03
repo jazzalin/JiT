@@ -9,7 +9,7 @@ main_jit.py \
 --num_images 16 --gen_bsz 16 --grid_size 16 --preview_classes 4 --sample_ema 2 \
 --img_size 256 --noise_scale 1.0 \
 --batch_size 128 --blr 5e-5 \
---epochs 200 --warmup_epochs 5 \
+--epochs 100 --warmup_epochs 1 --steps_per_epoch 5000 --save_last_freq 1 \
 --cfg 2.0 --interval_min 0.0 --interval_max 1.0 \
 --output_dir ./results/jit_cam --resume ./results/jit_cam \
 --data_path ./data --online_eval
