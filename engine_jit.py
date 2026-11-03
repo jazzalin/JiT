@@ -4,6 +4,7 @@ import os
 import shutil
 
 import torch
+import torchvision
 import numpy as np
 import cv2
 
@@ -68,14 +69,14 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     model_without_ddp.eval()
     world_size = misc.get_world_size()
     local_rank = misc.get_rank()
-    num_steps = args.num_images // (batch_size * world_size) + 1
+    num_steps = math.ceil(args.num_images / (batch_size * world_size))
 
     # Construct the folder name for saving generated images.
     save_folder = os.path.join(
         args.output_dir,
-        "{}-steps{}-cfg{}-interval{}-{}-image{}-res{}".format(
+        "{}-steps{}-cfg{}-interval{}-{}-image{}-res{}-epoch{:03d}".format(
             model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale,
-            model_without_ddp.cfg_interval[0], model_without_ddp.cfg_interval[1], args.num_images, args.img_size
+            model_without_ddp.cfg_interval[0], model_without_ddp.cfg_interval[1], args.num_images, args.img_size, epoch
         )
     )
     print("Save to:", save_folder)
@@ -97,6 +98,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
     class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
 
+    grid_images = []
     for i in range(num_steps):
         print("Generation step {}/{}".format(i, num_steps))
 
@@ -105,8 +107,11 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         labels_gen = class_label_gen_world[start_idx:end_idx]
         labels_gen = torch.Tensor(labels_gen).long().cuda()
 
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            sampled_images = model_without_ddp.generate(labels_gen)
+        # fixed noise per batch so samples are comparable across epochs; fork_rng leaves the training RNG untouched
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            torch.manual_seed(args.seed + world_size * i + local_rank)
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                sampled_images = model_without_ddp.generate(labels_gen)
 
         torch.distributed.barrier()
 
@@ -119,6 +124,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
             img_id = i * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
             if img_id >= args.num_images:
                 break
+            if len(grid_images) < args.grid_size:
+                grid_images.append(sampled_images[b_id].clamp(0, 1))
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
             cv2.imwrite(os.path.join(save_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
@@ -129,8 +136,15 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     print("Switch back from ema")
     model_without_ddp.load_state_dict(model_state_dict)
 
+    # sample grid from rank 0, saved next to the image folder so it survives the FID cleanup
+    if misc.is_main_process() and len(grid_images) > 0:
+        grid = torchvision.utils.make_grid(grid_images, nrow=math.ceil(math.sqrt(len(grid_images))), padding=2)
+        torchvision.utils.save_image(grid, save_folder + "-grid.png")
+        if log_writer is not None:
+            log_writer.add_image('samples', grid, epoch)
+
     # compute FID and IS
-    if log_writer is not None:
+    if log_writer is not None and not args.skip_fid:
         if args.img_size == 256:
             fid_statistics_file = 'fid_stats/jit_in256_stats.npz'
         elif args.img_size == 512:

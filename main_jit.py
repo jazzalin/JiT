@@ -86,6 +86,10 @@ def get_args_parser():
     parser.add_argument('--evaluate_gen', action='store_true')
     parser.add_argument('--gen_bsz', type=int, default=256,
                         help='Generation batch size')
+    parser.add_argument('--skip_fid', action='store_true',
+                        help='Only save generated images and a sample grid, skip FID/IS computation')
+    parser.add_argument('--grid_size', type=int, default=16,
+                        help='Number of generated images in the logged sample grid')
 
     # dataset
     parser.add_argument('--data_path', default='./data/imagenet', type=str,

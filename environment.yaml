@@ -5,6 +5,7 @@ dependencies:
   - python=3.10
   - pip
   - git
+  - gcc
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu121
       - torch==2.5.1+cu121
