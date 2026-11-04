@@ -225,17 +225,25 @@ class Photocast2DDataset(Dataset):
 
         return sample
 
-def get_photocast_dataloader(cfg):
-    """
-    """
+def get_photocast_transforms(cfg):
+    """Image transforms shared by training and evaluation (output in [-1, 1])"""
 
-    transforms = v2.Compose([
+    return v2.Compose([
         v2.Resize(cfg['data']['img_size'][0], interpolation=v2.InterpolationMode.BICUBIC),
         # fixed crop at the panorama center, i.e. the North-facing view after PanoramaNorthRoll
         v2.CenterCrop(cfg['data']['img_size']),
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
+
+def camera_csv_path(cfg, camera):
+    return os.path.join(cfg['data']['image_root_dir'], "images", "2026-09-24_train_cams", f"{camera}.csv")
+
+def get_photocast_dataloader(cfg):
+    """
+    """
+
+    transforms = get_photocast_transforms(cfg)
 
     datasets = []
     cameras = []
@@ -244,7 +252,7 @@ def get_photocast_dataloader(cfg):
 
         try:
             datasets.append(
-                Photocast2DDataset(csv_file=os.path.join(cfg['data']['image_root_dir'], "images", "2026-09-24_train_cams", f"{camera}.csv"),
+                Photocast2DDataset(csv_file=camera_csv_path(cfg, camera),
                                     image_root_dir=cfg['data']["image_root_dir"],
                                     img_transform=transforms,
                                     label=len(cameras))
