@@ -12,6 +12,7 @@
 
 apptainer exec --nv \
     --bind $PHOTOCAST_DATA_DIR/images:$PWD/data/images:ro \
+    --bind $PHOTOCAST_DATA_DIR/weather:$PWD/data/weather:ro \
     --bind $PHOTOCAST_OUTDIR/runs:$PWD/results \
     $HOME/.apptainer/jit.sif \
     $1

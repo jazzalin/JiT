@@ -56,9 +56,13 @@ trainer:
 
 data:
   lead_times: 
-    - 60
-    - 60
-  batch_size: 128
+    - 120
+    - 120
+  # images kept for training/evaluation, [start, end] inclusive (the weather for 2024-12-29 is broken)
+  date_ranges:
+    - ['2024-01-01 00:00:00', '2024-12-28 23:59:59']
+    - ['2025-01-01 00:00:00', '2025-12-31 23:59:59']
+  batch_size: 4
   eval_size:
   - 128
   - 1024
@@ -339,3 +343,5 @@ data:
   - 91e60d49c99ebd99bc13590ba2a500ec
 
   weather_root_dir: ./data/weather/inca
+  weather_scaler_file: ./data/weather/inca/2024/INCA_2024_std_scale.npz
+  dem_file: ./data/weather/inca/DEM_1000m_CH03.nc

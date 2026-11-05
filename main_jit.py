@@ -60,7 +60,12 @@ def get_args_parser():
     parser.add_argument('--P_std', default=0.8, type=float)
     parser.add_argument('--noise_scale', default=1.0, type=float)
     parser.add_argument('--t_eps', default=5e-2, type=float)
-    parser.add_argument('--label_drop_prob', default=0.1, type=float)
+    parser.add_argument('--cond_drop_prob', default=0.05, type=float,
+                        help='Probability of blacking out I0 and It_prev, independently, during training')
+    parser.add_argument('--cond_drop_both_prob', default=0.05, type=float,
+                        help='Probability of blacking out I0 and It_prev together during training')
+    parser.add_argument('--weather_drop_prob', default=0.1, type=float,
+                        help='Probability of replacing the weather by the learned null weather during training (weather CFG)')
 
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -77,11 +82,7 @@ def get_args_parser():
     parser.add_argument('--num_sampling_steps', default=50, type=int,
                         help='Sampling steps')
     parser.add_argument('--cfg', default=1.0, type=float,
-                        help='Classifier-free guidance factor')
-    parser.add_argument('--interval_min', default=0.0, type=float,
-                        help='CFG interval min')
-    parser.add_argument('--interval_max', default=1.0, type=float,
-                        help='CFG interval max')
+                        help='Weather classifier-free guidance scale for sampling (1.0 = no guidance)')
     parser.add_argument('--num_images', default=50000, type=int,
                         help='Number of images to generate')
     parser.add_argument('--eval_freq', type=int, default=40,
@@ -93,16 +94,15 @@ def get_args_parser():
     parser.add_argument('--skip_fid', action='store_true',
                         help='Only save generated images and a sample grid, skip FID/IS computation')
     parser.add_argument('--grid_size', type=int, default=16,
-                        help='Number of generated images in the logged sample grid')
-    parser.add_argument('--preview_classes', type=int, default=4,
-                        help='With --skip_fid: number of cameras (evenly spaced class ids) shown in the preview, one grid row each')
+                        help='Number of forecasts in the logged sample grid (one row each: It_prev, I0, It, forecast)')
     parser.add_argument('--sample_ema', type=str, default='1', choices=['1', '2', 'none'],
                         help='Weights used for generation: ema_params1, ema_params2 or the raw (non-EMA) weights')
 
     # dataset
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
                         help='Path to the dataset')
-    parser.add_argument('--class_num', default=1, type=int)
+    parser.add_argument('--weather_patch_size', default=2, type=int,
+                        help='Patch size (in weather grid cells) for tokenizing the weather fields')
     parser.add_argument('--config', type=str, default="config.yml")
 
     # checkpointing
@@ -156,10 +156,18 @@ def main(args):
 
     dataset_train = get_photocast_dataloader(config)
 
-    # one class per camera that actually loaded; overrides --class_num so the label embedding always matches the data
-    if args.class_num != len(dataset_train.cameras):
-        print("Setting class_num to {} (number of loaded cameras, was {})".format(len(dataset_train.cameras), args.class_num))
-    args.class_num = len(dataset_train.cameras)
+    # conditioning sizes from one sample: (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
+    I0, _, It_prev, w0, wt, wt_prev, angle_mask, view_mask = dataset_train[0]["tensors"]
+    args.cond_channels = I0.shape[0] + It_prev.shape[0] + angle_mask.shape[0] + view_mask.shape[0]
+    args.weather_channels = w0.shape[0]  # per time step, the embedder is shared across (wt, w0, wt_prev)
+    args.weather_times = 3
+    assert w0.shape[1] == w0.shape[2], "weather crops must be square, got {}".format(tuple(w0.shape[1:]))
+    args.weather_size = w0.shape[1]
+    print("Conditioning: {} frame channels, {} x {} weather channels on a {}x{} grid ({} tokens)".format(
+        args.cond_channels, args.weather_times, args.weather_channels, args.weather_size, args.weather_size,
+        args.weather_times * (args.weather_size // args.weather_patch_size) ** 2))
+
+    # record of the cameras that loaded
     if global_rank == 0 and args.output_dir:
         with open(os.path.join(args.output_dir, "cameras.json"), "w") as f:
             json.dump(dataset_train.cameras, f, indent=2)
@@ -242,7 +250,7 @@ def main(args):
         with torch.random.fork_rng():
             torch.manual_seed(seed)
             with torch.no_grad():
-                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, dataset_train, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
         return
 
     # Training loop
@@ -276,7 +284,7 @@ def main(args):
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             with torch.no_grad():
-                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, dataset_train, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
             torch.cuda.empty_cache()
 
         if misc.is_main_process() and log_writer is not None:

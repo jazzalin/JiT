@@ -77,20 +77,6 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class LabelEmbedder(nn.Module):
-    """
-    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
-    """
-    def __init__(self, num_classes, hidden_size):
-        super().__init__()
-        self.embedding_table = nn.Embedding(num_classes + 1, hidden_size)
-        self.num_classes = num_classes
-
-    def forward(self, labels):
-        embeddings = self.embedding_table(labels)
-        return embeddings
-
-
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1))
@@ -211,15 +197,18 @@ class JiT(nn.Module):
         input_size=256,
         patch_size=16,
         in_channels=3,
+        cond_channels=0,
+        weather_channels=0,
+        weather_times=3,
+        weather_size=16,
+        weather_patch_size=2,
         hidden_size=1024,
         depth=24,
         num_heads=16,
         mlp_ratio=4.0,
         attn_drop=0.0,
         proj_drop=0.0,
-        num_classes=1000,
         bottleneck_dim=128,
-        in_context_len=32,
         in_context_start=8
     ):
         super().__init__()
@@ -229,25 +218,29 @@ class JiT(nn.Module):
         self.num_heads = num_heads
         self.hidden_size = hidden_size
         self.input_size = input_size
-        self.in_context_len = in_context_len
         self.in_context_start = in_context_start
-        self.num_classes = num_classes
 
-        # time and class embed
+        # time embed
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size)
 
-        # linear embed
-        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
+        # linear embed of the noisy image channel-concatenated with the conditioning frames
+        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels + cond_channels, bottleneck_dim, hidden_size, bias=True)
+
+        # weather fields are patchified into in-context tokens by an embedder shared across time steps;
+        # a learned time-slot embedding (one per weather time) tells the time steps apart
+        assert weather_size % weather_patch_size == 0, "weather_size must be a multiple of weather_patch_size"
+        self.weather_times = weather_times
+        self.w_embedder = BottleneckPatchEmbed(weather_size, weather_patch_size, weather_channels, bottleneck_dim, hidden_size, bias=True)
+        self.w_pos_embed = nn.Parameter(torch.zeros(1, 1, self.w_embedder.num_patches, hidden_size), requires_grad=False)
+        self.w_time_embed = nn.Parameter(torch.zeros(1, weather_times, 1, hidden_size), requires_grad=True)
+        # learned null weather tokens, used in place of the weather when it is dropped (training) or for CFG
+        self.w_null = nn.Parameter(torch.zeros(1, weather_times * self.w_embedder.num_patches, hidden_size), requires_grad=True)
+        self.in_context_len = weather_times * self.w_embedder.num_patches
 
         # use fixed sin-cos embedding
         num_patches = self.x_embedder.num_patches
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
-        # in-context cls token
-        if self.in_context_len > 0:
-            self.in_context_posemb = nn.Parameter(torch.zeros(1, self.in_context_len, hidden_size), requires_grad=True)
-            torch.nn.init.normal_(self.in_context_posemb, std=.02)
 
         # rope
         half_head_dim = hidden_size // num_heads // 2
@@ -289,15 +282,18 @@ class JiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w1 = self.x_embedder.proj1.weight.data
-        nn.init.xavier_uniform_(w1.view([w1.shape[0], -1]))
-        w2 = self.x_embedder.proj2.weight.data
-        nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj2.bias, 0)
+        w_pos_embed = get_2d_sincos_pos_embed(self.w_pos_embed.shape[-1], int(self.w_embedder.num_patches ** 0.5))
+        self.w_pos_embed.data.copy_(torch.from_numpy(w_pos_embed).float()[None, None])
+        nn.init.normal_(self.w_time_embed, std=.02)
+        nn.init.normal_(self.w_null, std=.02)
 
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        for embedder in (self.x_embedder, self.w_embedder):
+            w1 = embedder.proj1.weight.data
+            nn.init.xavier_uniform_(w1.view([w1.shape[0], -1]))
+            w2 = embedder.proj2.weight.data
+            nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
+            nn.init.constant_(embedder.proj2.bias, 0)
 
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
@@ -328,27 +324,31 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, cond, w, w_drop=None):
         """
-        x: (N, C, H, W)
+        x: (N, C, H, W) noisy image
         t: (N,)
-        y: (N,)
+        cond: (N, C_cond, H, W) conditioning frames
+        w: (N, T, C_w, H_w, W_w) weather fields at T times
+        w_drop: (N,) bool, samples whose weather is replaced by the null weather tokens
         """
-        # class and time embeddings
+        # weather tokens (shared embedder per time + spatial and time-slot embeddings), pooled into the time embedding for adaLN
+        N, T = w.shape[:2]
+        w_tokens = self.w_embedder(w.flatten(0, 1)).unflatten(0, (N, T))
+        w_tokens = (w_tokens + self.w_pos_embed + self.w_time_embed).flatten(1, 2)
+        if w_drop is not None:
+            w_tokens = torch.where(w_drop.view(-1, 1, 1), self.w_null.to(w_tokens.dtype), w_tokens)
         t_emb = self.t_embedder(t)
-        y_emb = self.y_embedder(y)
-        c = t_emb + y_emb
+        c = t_emb + w_tokens.mean(dim=1)
 
         # forward JiT
-        x = self.x_embedder(x)
+        x = self.x_embedder(torch.cat([x, cond], dim=1))
         x += self.pos_embed
 
         for i, block in enumerate(self.blocks):
             # in-context
             if self.in_context_len > 0 and i == self.in_context_start:
-                in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
-                in_context_tokens += self.in_context_posemb
-                x = torch.cat([in_context_tokens, x], dim=1)
+                x = torch.cat([w_tokens, x], dim=1)
             x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext)
 
         x = x[:, self.in_context_len:]
@@ -361,27 +361,27 @@ class JiT(nn.Module):
 
 def JiT_B_16(**kwargs):
     return JiT(depth=12, hidden_size=768, num_heads=12,
-               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=16, **kwargs)
+               bottleneck_dim=128, in_context_start=4, patch_size=16, **kwargs)
 
 def JiT_B_32(**kwargs):
     return JiT(depth=12, hidden_size=768, num_heads=12,
-               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=32, **kwargs)
+               bottleneck_dim=128, in_context_start=4, patch_size=32, **kwargs)
 
 def JiT_L_16(**kwargs):
     return JiT(depth=24, hidden_size=1024, num_heads=16,
-               bottleneck_dim=128, in_context_len=32, in_context_start=8, patch_size=16, **kwargs)
+               bottleneck_dim=128, in_context_start=8, patch_size=16, **kwargs)
 
 def JiT_L_32(**kwargs):
     return JiT(depth=24, hidden_size=1024, num_heads=16,
-               bottleneck_dim=128, in_context_len=32, in_context_start=8, patch_size=32, **kwargs)
+               bottleneck_dim=128, in_context_start=8, patch_size=32, **kwargs)
 
 def JiT_H_16(**kwargs):
     return JiT(depth=32, hidden_size=1280, num_heads=16,
-               bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=16, **kwargs)
+               bottleneck_dim=256, in_context_start=10, patch_size=16, **kwargs)
 
 def JiT_H_32(**kwargs):
     return JiT(depth=32, hidden_size=1280, num_heads=16,
-               bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=32, **kwargs)
+               bottleneck_dim=256, in_context_start=10, patch_size=32, **kwargs)
 
 
 JiT_models = {

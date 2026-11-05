@@ -1,15 +1,21 @@
 """
-Generate novel views for selected cameras with a trained class-conditional (camera id) JiT.
+Forecast It for selected cameras with a trained JiT conditioned on (I0, It_prev) and the weather (wt, w0, wt_prev).
 
-For every camera, one grid is saved with
-  - a "real" row: the pixel-wise median of real images (approximates the static scene) followed by random real images,
-  - one row per (EMA, CFG) setting, all using the same noise per column,
-so structures can be compared against the real scene and the effect of CFG/EMA seen with everything else fixed.
-An overview grid per (EMA, CFG) with one row per camera and the individual PNGs are saved as well.
+For every camera, a fixed random set of (It_prev, I0, It) triples is forecast with --num_seeds noise seeds per EMA,
+either on 256x256 crops (the training resolution) or on full panoramas. Full panoramas are sampled by tiling:
+at every ODE step the model denoises overlapping 256x256 crops around the 360 deg panorama (wrapping at the seam,
+each crop with its own angle_mask) and the overlapping velocity predictions are averaged (MultiDiffusion).
+
+Outputs, per mode (crop / panorama):
+  - grids/<camera>.png: per camera, the conditioning frames, the ground truth and the forecasts of every sample
+  - overview_ema<e>_cfg<c>.png: ground truth and first forecast of every camera
+  - ema<e>/cfg<c>/<camera>/<I0 datetime>_seed<s>.png: individual forecasts (plus <I0 datetime>_gt.png)
+Every (EMA, weather CFG scale) setting uses the same noise, so settings can be compared sample by sample.
+  - samples.json: camera and (It_prev, I0, It) datetimes of every sample
 
 Example:
-    python sample_cameras.py --checkpoint results/jit_cam --cameras 0 12 d9be9239aa3d708b8e25601445937eed \
-        --cfg 1.0 1.5 2.0 3.0 --ema 1 --num_samples 8
+    python sample_cameras.py --checkpoint results/jit_forecast --split val --mode crop panorama --num_samples 4 \
+        --cfg 1.0 2.0 4.0
 """
 import os
 import re
@@ -20,46 +26,47 @@ import argparse
 import numpy as np
 import torch
 import torchvision
+import xarray as xr
 import yaml
 from PIL import Image, ImageDraw
 
 from denoiser import Denoiser
-from photocast_dataloader import Photocast2DDataset, get_photocast_transforms, camera_csv_path
+from photocast_dataloader import Photocast2DDatasetZarr, get_photocast_transforms, camera_csv_path
 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('JiT camera sampling', add_help=False)
+    parser = argparse.ArgumentParser('JiT camera forecasts', add_help=False)
     parser.add_argument('--checkpoint', required=True, type=str,
                         help='Checkpoint file, or a run folder (uses checkpoint-last.pth, else the highest checkpoint-N.pth)')
-    parser.add_argument('--cameras_json', default=None, type=str,
-                        help='Class id -> camera mapping (default: cameras.json next to the checkpoint)')
-    parser.add_argument('--config', default='config.yml', type=str,
-                        help='Data config, used to load real images for comparison')
+    parser.add_argument('--config', default='config.yml', type=str, help='Data config')
     parser.add_argument('--output_dir', default=None, type=str,
                         help='Default: <run folder>/samples-<checkpoint name>')
 
-    # what to generate
+    # what to forecast
     parser.add_argument('--cameras', nargs='*', default=None,
-                        help='Class ids or camera hashes (default: --num_cameras evenly spaced class ids)')
-    parser.add_argument('--num_cameras', default=8, type=int)
-    parser.add_argument('--cfg', nargs='+', default=[1.0, 1.5, 2.0, 3.0], type=float,
-                        help='CFG scales, one grid row each')
+                        help='Camera hashes (default: --num_cameras evenly spaced cameras of --split)')
+    parser.add_argument('--split', default='val', choices=['train', 'val'],
+                        help='Camera list of the config used when --cameras is not given')
+    parser.add_argument('--num_cameras', default=4, type=int)
+    parser.add_argument('--num_samples', default=4, type=int, help='(It_prev, I0, It) triples per camera')
+    parser.add_argument('--num_seeds', default=2, type=int, help='Forecasts per triple and EMA')
+    parser.add_argument('--mode', nargs='+', default=['crop'], choices=['crop', 'panorama'],
+                        help='crop: 256x256 crops as in training; panorama: tiled sampling of the full panorama')
+    parser.add_argument('--crop', default='center', choices=['center', 'random'],
+                        help='Crop used in crop mode (random crops are fixed by --seed)')
     parser.add_argument('--ema', nargs='+', default=['1'], choices=['1', '2', 'none'],
-                        help='Weights: ema_params1 (smoothest once training is long), ema_params2 or raw weights')
-    parser.add_argument('--num_samples', default=8, type=int, help='Samples per camera and setting (grid columns)')
+                        help='Weights: ema_params1, ema_params2 or raw weights')
+    parser.add_argument('--cfg', nargs='+', default=[1.0], type=float,
+                        help='Weather CFG scales (1.0 = no guidance); needs a checkpoint trained with --weather_drop_prob > 0')
     parser.add_argument('--seed', default=0, type=int)
 
     # sampler
     parser.add_argument('--sampling_method', default='heun', type=str)
     parser.add_argument('--num_sampling_steps', default=50, type=int)
-    parser.add_argument('--interval_min', default=0.0, type=float, help='CFG interval min')
-    parser.add_argument('--interval_max', default=1.0, type=float, help='CFG interval max')
-
-    # real images for comparison
-    parser.add_argument('--num_real', default=None, type=int,
-                        help='Random real images in the reference row (default: num_samples - 1, after the median)')
-    parser.add_argument('--median_from', default=200, type=int,
-                        help='Number of real images for the pixel-wise median (0 = no median)')
+    parser.add_argument('--tile_stride', default=128, type=int,
+                        help='Panorama mode: horizontal stride between 256x256 tiles (smaller = more overlap)')
+    parser.add_argument('--tile_batch', default=64, type=int,
+                        help='Panorama mode: tiles per forward pass')
     return parser
 
 
@@ -76,71 +83,108 @@ def resolve_checkpoint(path):
     return max(numbered, key=lambda p: int(re.search(r'checkpoint-(\d+)\.pth$', p).group(1)))
 
 
-def resolve_cameras(requested, cameras, num_cameras):
-    if not requested:
-        return np.unique(np.linspace(0, len(cameras) - 1, min(num_cameras, len(cameras))).round().astype(int)).tolist()
-    class_ids = []
-    for c in requested:
-        if c in cameras:
-            class_ids.append(cameras.index(c))
-        elif c.isdigit() and int(c) < len(cameras):
-            class_ids.append(int(c))
-        else:
-            raise ValueError('Unknown camera "{}": not a class id < {} nor a hash in cameras.json'.format(c, len(cameras)))
-    return class_ids
-
-
 def to_unit(x):
     """[-1, 1] -> [0, 1]"""
     return ((x.float() + 1) / 2).clamp(0, 1)
 
 
-def load_real_images(cfg, camera, num_real, median_from, seed):
-    """Returns (median image or None, list of real images) in [0, 1], or (None, []) if the data is not available"""
-    try:
-        dataset = Photocast2DDataset(csv_file=camera_csv_path(cfg, camera), image_root_dir=cfg['data']['image_root_dir'],
-                                     img_transform=get_photocast_transforms(cfg))
-    except (FileNotFoundError, IndexError) as e:
-        print('  no real images for {}: {}'.format(camera, e))
-        return None, []
-
-    rng = np.random.default_rng(seed)
-    n = max(num_real, median_from)
-    idx = rng.choice(len(dataset), size=min(n, len(dataset)), replace=False)
-    try:
-        images = [to_unit(dataset[int(i)]['tensors'][0]) for i in idx]
-    except (FileNotFoundError, OSError) as e:
-        print('  could not read real images for {}: {}'.format(camera, e))
-        return None, []
-
-    median = torch.stack(images).median(dim=0).values if median_from > 0 else None
-    return median, images[:num_real]
+def load_sample(dataset, index, seed):
+    """Loads a dataset sample with a fixed random crop, without touching the global RNG"""
+    with torch.random.fork_rng():
+        torch.manual_seed(seed + index)
+        return dataset[index]
 
 
-def annotated_grid(rows, ncols, title=None, pad=2, margin=150, title_height=24):
+@torch.no_grad()
+def generate_tiled(model, I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask, tile=256, stride=128, tile_batch=64):
     """
-    rows: list of (label, list of [3, H, W] tensors in [0, 1]); missing tiles are left black.
-    Returns a PIL image with the row labels in a left margin.
+    Samples full panoramas It [B, 3, H, W] with a model trained on tile x tile crops: at every step the velocity
+    is predicted on overlapping crops (wrapping around the 360 deg seam) and averaged where crops overlap.
     """
-    _, H, W = next(t for _, tiles in rows for t in tiles).shape
-    blank = torch.zeros(3, H, W)
+    cond, w = model.make_conditioning(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
+    B, _, H, W = I0.shape
+    assert H == tile, 'panorama height {} must equal the tile size {}'.format(H, tile)
+    device = I0.device
+
+    # column indices of every tile, wrapping at the seam
+    offsets = torch.arange(0, W, stride, device=device)
+    cols = (offsets[:, None] + torch.arange(tile, device=device)[None]) % W  # [n_tiles, tile]
+    n_tiles = cols.shape[0]
+    counts = torch.zeros(W, device=device).index_add_(0, cols.flatten(), torch.ones(cols.numel(), device=device))
+
+    def tiles(x):
+        # [B, C, H, W] -> [B * n_tiles, C, H, tile]
+        return x[..., cols].permute(0, 3, 1, 2, 4).flatten(0, 1)
+
+    cond_tiles = tiles(cond)
+    w_tiles = w.repeat_interleave(n_tiles, dim=0)
+
+    def velocity(z, t):
+        z_tiles = tiles(z)
+        t_tiles = t.repeat_interleave(n_tiles)
+        t_tiles = t_tiles.view(-1, 1, 1, 1)
+        v_tiles = torch.cat([model._forward_sample(z_tiles[i:i + tile_batch], t_tiles[i:i + tile_batch],
+                                                   cond_tiles[i:i + tile_batch], w_tiles[i:i + tile_batch])
+                             for i in range(0, z_tiles.shape[0], tile_batch)])
+        # [B * n_tiles, C, H, tile] -> accumulate into [B, C, H, W]
+        v_tiles = v_tiles.unflatten(0, (B, n_tiles)).permute(0, 2, 3, 1, 4).flatten(3)
+        v = torch.zeros_like(z).index_add_(3, cols.flatten(), v_tiles.float())
+        return v / counts
+
+    z = model.noise_scale * torch.randn(B, 3, H, W, device=device)
+    timesteps = torch.linspace(0.0, 1.0, model.steps + 1, device=device)
+
+    def euler(z, t, t_next):
+        return z + (t_next - t) * velocity(z, t.expand(B))
+
+    def heun(z, t, t_next):
+        v_t = velocity(z, t.expand(B))
+        v_next = velocity(z + (t_next - t) * v_t, t_next.expand(B))
+        return z + (t_next - t) * 0.5 * (v_t + v_next)
+
+    stepper = {'euler': euler, 'heun': heun}[model.method]
+    for i in range(model.steps - 1):
+        z = stepper(z, timesteps[i], timesteps[i + 1])
+    # last step euler
+    return euler(z, timesteps[-2], timesteps[-1])
+
+
+def annotated_grid(rows, ncols=None, title=None, col_labels=None, pad=2, margin=170, title_height=24, header_height=16):
+    """
+    rows: list of (label, list of [3, H, W] tensors in [0, 1]); None or missing tiles are left white.
+    Rows may have different tile widths (crops vs panoramas). Returns a PIL image with the row labels in a left margin.
+    """
+    ncols = ncols or max(len(tiles) for _, tiles in rows)
     row_images = []
     for _, tiles in rows:
-        tiles = list(tiles) + [blank] * (ncols - len(tiles))
-        grid = torchvision.utils.make_grid(tiles[:ncols], nrow=ncols, padding=pad)
+        ref = next(t for t in tiles if t is not None)
+        tiles = [t if t is not None else torch.ones_like(ref) for t in tiles]
+        tiles = tiles + [torch.ones_like(ref)] * (ncols - len(tiles))
+        grid = torchvision.utils.make_grid(tiles[:ncols], nrow=ncols, padding=pad, pad_value=1.0)
         row_images.append(Image.fromarray((grid.permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)))
 
-    top = title_height if title else 0
-    canvas = Image.new('RGB', (margin + row_images[0].width, top + sum(r.height for r in row_images)), 'white')
+    top = (title_height if title else 0) + (header_height if col_labels else 0)
+    width = margin + max(r.width for r in row_images)
+    canvas = Image.new('RGB', (width, top + sum(r.height for r in row_images)), 'white')
     draw = ImageDraw.Draw(canvas)
     if title:
         draw.text((4, 4), title, fill='black')
+    if col_labels:
+        tile_w = (row_images[0].width - pad) // ncols
+        for c, label in enumerate(col_labels):
+            draw.text((margin + pad + c * tile_w + 4, top - header_height + 2), label, fill='black')
     y = top
     for (label, _), img in zip(rows, row_images):
         canvas.paste(img, (margin, y))
-        draw.text((4, y + img.height // 2 - 6), label, fill='black')
+        for k, line in enumerate(label.split('\n')):
+            draw.text((4, y + img.height // 2 - 6 * len(label.split('\n')) + 12 * k), line, fill='black')
         y += img.height
     return canvas
+
+
+def save_image(x, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torchvision.utils.save_image(x, path)
 
 
 @torch.no_grad()
@@ -151,71 +195,140 @@ def main(args):
     ckpt_name = os.path.splitext(os.path.basename(ckpt_path))[0]
     print('Checkpoint:', ckpt_path)
 
-    with open(args.cameras_json or os.path.join(run_dir, 'cameras.json')) as f:
-        cameras = json.load(f)
     with open(args.config, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
 
     checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     train_args = checkpoint['args']
-    assert train_args.class_num == len(cameras), \
-        'Checkpoint has {} classes but cameras.json lists {} cameras'.format(train_args.class_num, len(cameras))
     print('Trained for {} epochs'.format(checkpoint.get('epoch', -1) + 1))
 
     # sampler settings from the command line, architecture from training
     train_args.sampling_method = args.sampling_method
     train_args.num_sampling_steps = args.num_sampling_steps
-    train_args.interval_min, train_args.interval_max = args.interval_min, args.interval_max
     model = Denoiser(train_args).to(device).eval()
+    tile = train_args.img_size
 
-    class_ids = resolve_cameras(args.cameras, cameras, args.num_cameras)
-    num_real = args.num_samples - 1 if args.num_real is None else args.num_real
+    cameras = args.cameras
+    if not cameras:
+        split = cfg['data'][args.split]
+        idx = np.unique(np.linspace(0, len(split) - 1, min(args.num_cameras, len(split))).round().astype(int))
+        cameras = [split[i] for i in idx]
     output_dir = args.output_dir or os.path.join(run_dir, 'samples-{}'.format(ckpt_name))
-    os.makedirs(output_dir, exist_ok=True)
-    print('Cameras (class id: hash):', {c: cameras[c] for c in class_ids})
+    print('Cameras:', cameras)
     print('Output:', output_dir)
 
+    shared_weather = xr.open_zarr(os.path.join(cfg['data']['weather_root_dir'], 'inca.zarr'), consolidated=True, chunks=None)
     weight_keys = {'1': 'model_ema1', '2': 'model_ema2', 'none': 'model'}
     settings = [(e, c) for e in args.ema for c in args.cfg]
-    samples = {}  # (class id, ema, cfg) -> [num_samples, 3, H, W] in [0, 1]
+    if any(c != 1.0 for c in args.cfg) and getattr(train_args, 'weather_drop_prob', 0.0) == 0:
+        print('WARNING: the checkpoint was trained without weather dropout, its null weather tokens are untrained')
 
-    for ema in args.ema:
-        model.load_state_dict(checkpoint[weight_keys[ema]])
-        for cfg_scale in args.cfg:
+    for mode in args.mode:
+        mode_dir = os.path.join(output_dir, mode if mode == 'panorama' else 'crop-{}'.format(args.crop))
+        transform = get_photocast_transforms(cfg, crop=args.crop if mode == 'crop' else None)
+
+        # load the conditioning and ground truth of every camera once
+        data = {}  # camera -> (list of samples, batched tensors on the device)
+        for camera in cameras:
+            try:
+                dataset = Photocast2DDatasetZarr(csv_file=camera_csv_path(cfg, camera),
+                                                 image_root_dir=cfg['data']['image_root_dir'],
+                                                 shared_weather_ds=shared_weather,
+                                                 weather_scaler_file=cfg['data']['weather_scaler_file'],
+                                                 viewshed_radius=cfg['data']['viewshed_radius'],
+                                                 img_transform=transform,
+                                                 lead_times=cfg['data']['lead_times'],
+                                                 date_ranges=cfg['data'].get('date_ranges'))
+            except (FileNotFoundError, IndexError) as e:
+                print('  skipping {}: {}'.format(camera, e))
+                continue
+            rng = np.random.default_rng(args.seed)
+            idx = rng.choice(len(dataset), size=min(args.num_samples, len(dataset)), replace=False)
+            samples = [load_sample(dataset, int(i), args.seed) for i in idx]
+            tensors = [torch.stack([s['tensors'][k] for s in samples]).to(device) for k in range(len(samples[0]['tensors']))]
+            data[camera] = (samples, tensors)
+
+        os.makedirs(mode_dir, exist_ok=True)
+        with open(os.path.join(mode_dir, 'samples.json'), 'w') as f:
+            json.dump({c: [s['datetimes'] for s in samples] for c, (samples, _) in data.items()}, f, indent=2)
+
+        # forecasts: (camera, ema, cfg) -> [num_samples, num_seeds, 3, H, W] in [0, 1]
+        forecasts = {}
+        for ema, cfg_scale in settings:
+            model.load_state_dict(checkpoint[weight_keys[ema]])
             model.cfg_scale = cfg_scale
-            for class_id in class_ids:
-                print('ema {} cfg {} class {}'.format(ema, cfg_scale, class_id))
-                labels = torch.full((args.num_samples,), class_id, dtype=torch.long, device=device)
-                # same seed -> same initial noise for every camera, EMA and CFG setting
+            for camera, (samples, tensors) in data.items():
+                I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask = tensors
+                print('{} ema {} cfg {} camera {} ({}x{})'.format(mode, ema, cfg_scale, camera, I0.shape[-2], I0.shape[-1]))
+                # every sample repeated num_seeds times; same seed -> same noise for every setting
+                cond = [x.repeat_interleave(args.num_seeds, dim=0) for x in (I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)]
                 torch.manual_seed(args.seed)
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    images = to_unit(model.generate(labels)).cpu()
-                samples[(class_id, ema, cfg_scale)] = images
+                    if mode == 'crop':
+                        x = model.generate(*cond)
+                    else:
+                        x = generate_tiled(model, *cond, tile=tile, stride=args.tile_stride, tile_batch=args.tile_batch)
+                # the model gets no training signal outside the field of view: show it black like the real frames
+                x = torch.where(cond[-1] > 0, x.float(), -1.0)
+                x = to_unit(x).cpu().unflatten(0, (len(samples), args.num_seeds))
+                forecasts[(camera, ema, cfg_scale)] = x
 
-                sample_dir = os.path.join(output_dir, 'ema{}'.format(ema), 'cfg{}'.format(cfg_scale),
-                                          'class{:03d}_{}'.format(class_id, cameras[class_id]))
-                os.makedirs(sample_dir, exist_ok=True)
-                for k, img in enumerate(images):
-                    torchvision.utils.save_image(img, os.path.join(sample_dir, 'seed{}_{:02d}.png'.format(args.seed, k)))
+                sample_dir = os.path.join(mode_dir, 'ema{}'.format(ema), 'cfg{}'.format(cfg_scale), camera)
+                for s, sample in enumerate(samples):
+                    name = sample['datetimes'][1]
+                    save_image(to_unit(It[s]).cpu(), os.path.join(sample_dir, '{}_gt.png'.format(name)))
+                    for k in range(args.num_seeds):
+                        save_image(x[s, k], os.path.join(sample_dir, '{}_seed{}.png'.format(name, args.seed + k)))
 
-    # per-camera grid: real row + one row per setting
-    grid_dir = os.path.join(output_dir, 'grids')
-    os.makedirs(grid_dir, exist_ok=True)
-    for class_id in class_ids:
-        camera = cameras[class_id]
-        median, real = load_real_images(cfg, camera, num_real, args.median_from, args.seed)
-        rows = []
-        if median is not None or real:
-            rows.append(('real (median, random)' if median is not None else 'real', ([median] if median is not None else []) + real))
-        rows += [('ema{} cfg{}'.format(e, c), list(samples[(class_id, e, c)])) for e, c in settings]
-        grid = annotated_grid(rows, args.num_samples, title='class {}  camera {}  ({})'.format(class_id, camera, ckpt_name))
-        grid.save(os.path.join(grid_dir, 'class{:03d}_{}.png'.format(class_id, camera)))
+        # per-camera grids
+        grid_dir = os.path.join(mode_dir, 'grids')
+        os.makedirs(grid_dir, exist_ok=True)
+        forecast_keys = [(e, c, k) for e, c in settings for k in range(args.num_seeds)]
+        forecast_labels = ['ema{} cfg{} #{}'.format(e, c, k) for e, c, k in forecast_keys]
+        for camera, (samples, tensors) in data.items():
+            I0, It, It_prev = (to_unit(t).cpu() for t in tensors[:3])
+            title = '{}  camera {}  ({})'.format(mode, camera, ckpt_name)
+            if mode == 'crop':
+                # one row per sample: It_prev | I0 | It | forecasts
+                rows = []
+                for s, sample in enumerate(samples):
+                    dt_prev, dt0, dtt = sample['datetimes']
+                    rows.append(('I0 {}\nIt {}'.format(dt0, dtt),
+                                 [It_prev[s], I0[s], It[s]] + [forecasts[(camera, e, c)][s, k] for e, c, k in forecast_keys]))
+                grid = annotated_grid(rows, title=title, col_labels=['It_prev (-24h)', 'I0', 'It (truth)'] + forecast_labels)
+            else:
+                # panoramas are wide: one row per image, blocks of rows per sample separated by a blank row
+                rows = []
+                for s, sample in enumerate(samples):
+                    dt_prev, dt0, dtt = sample['datetimes']
+                    rows += [('It_prev {}'.format(dt_prev), [It_prev[s]]),
+                             ('I0 {}'.format(dt0), [I0[s]]),
+                             ('It {} (truth)'.format(dtt), [It[s]])]
+                    rows += [('forecast {}'.format(lab), [forecasts[(camera, e, c)][s, k]])
+                             for lab, (e, c, k) in zip(forecast_labels, forecast_keys)]
+                    if s + 1 < len(samples):
+                        rows.append(('', [torch.ones(3, 24, It.shape[-1])]))
+                grid = annotated_grid(rows, ncols=1, title=title)
+            grid.save(os.path.join(grid_dir, '{}.png'.format(camera)))
 
-    # overview per setting: one row per camera
-    for e, c in settings:
-        rows = [('class {}'.format(k), list(samples[(k, e, c)])) for k in class_ids]
-        grid = annotated_grid(rows, args.num_samples, title='ema{} cfg{}  ({})'.format(e, c, ckpt_name))
-        grid.save(os.path.join(output_dir, 'overview_ema{}_cfg{}.png'.format(e, c)))
+        # overview per setting: truth and first forecast of every camera
+        for e, c in settings:
+            rows = []
+            for camera, (samples, tensors) in data.items():
+                It = to_unit(tensors[1]).cpu()
+                if mode == 'crop':
+                    tiles = []
+                    for s in range(len(samples)):
+                        tiles += [It[s], forecasts[(camera, e, c)][s, 0]]
+                    rows.append((camera[:12], tiles))
+                else:
+                    rows += [('{} truth'.format(camera[:12]), [It[0]]),
+                             ('{} forecast'.format(camera[:12]), [forecasts[(camera, e, c)][0, 0]])]
+            col_labels = [lab for s in range(args.num_samples) for lab in ('#{} truth'.format(s), '#{} forecast'.format(s))] \
+                if mode == 'crop' else None
+            grid = annotated_grid(rows, ncols=None if mode == 'crop' else 1, col_labels=col_labels,
+                                  title='{} ema{} cfg{}  ({})'.format(mode, e, c, ckpt_name))
+            grid.save(os.path.join(mode_dir, 'overview_ema{}_cfg{}.png'.format(e, c)))
 
     print('Done.')
 

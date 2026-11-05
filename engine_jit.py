@@ -2,9 +2,11 @@ import math
 import sys
 import os
 import shutil
+import json
 
 import torch
 import torchvision
+from torch.utils.data import default_collate
 import numpy as np
 import cv2
 
@@ -27,15 +29,13 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         print('log_dir: {}'.format(log_writer.log_dir))
 
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        x = batch["tensors"][0].to(device, non_blocking=True) # selecting I0 only
-        labels = batch["labels"]  # camera index
+        # (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
+        tensors = [t.to(device, non_blocking=True) for t in batch["tensors"]]
         # per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-        labels = labels.to(device, non_blocking=True)
-
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            loss = model(x, labels)
+            loss = model(*tensors)
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -64,7 +64,14 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
                 log_writer.add_scalar('lr', lr, epoch_1000x)
 
 
-def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
+def load_preview_sample(dataset, index, seed):
+    """Loads a dataset sample with a fixed random crop, without touching the global RNG"""
+    with torch.random.fork_rng():
+        torch.manual_seed(seed + index)
+        return dataset[index]
+
+
+def evaluate(model_without_ddp, dataset, args, epoch, batch_size=64, log_writer=None):
 
     model_without_ddp.eval()
     world_size = misc.get_world_size()
@@ -74,9 +81,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     # Construct the folder name for saving generated images.
     save_folder = os.path.join(
         args.output_dir,
-        "{}-steps{}-cfg{}-interval{}-{}-image{}-res{}-ema{}-epoch{:03d}".format(
-            model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale,
-            model_without_ddp.cfg_interval[0], model_without_ddp.cfg_interval[1], args.num_images, args.img_size,
+        "{}-steps{}-cfg{}-image{}-res{}-ema{}-epoch{:03d}".format(
+            model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale, args.num_images, args.img_size,
             args.sample_ema, epoch
         )
     )
@@ -95,20 +101,13 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         print("Switch to ema{}".format(args.sample_ema))
         model_without_ddp.load_state_dict(ema_state_dict)
 
-    # ensure that the number of images per class is equal.
-    class_num = args.class_num
-    if args.skip_fid:
-        # preview: a few evenly spaced cameras, consecutive images per camera so each grid row is one camera
-        preview_classes = np.unique(np.linspace(0, class_num - 1, min(args.preview_classes, class_num)).round().astype(int))
-        assert args.num_images % len(preview_classes) == 0, "num_images must be a multiple of the number of preview cameras"
-        images_per_class = args.num_images // len(preview_classes)
-        class_label_gen_world = preview_classes.repeat(images_per_class)
-        print("Preview class ids:", preview_classes.tolist())
-    else:
-        assert args.num_images % class_num == 0, "Number of images per class must be the same"
-        images_per_class = None
-        class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
-    class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
+    # fixed preview samples (same seed every epoch) so forecasts are comparable across epochs
+    preview_idx = np.random.default_rng(args.seed).choice(len(dataset), min(args.num_images, len(dataset)), replace=False)
+    preview_idx = np.hstack([preview_idx, np.zeros(world_size * batch_size * num_steps, dtype=int)])
+    if misc.is_main_process():
+        with open(save_folder + "-preview.json", "w") as f:
+            json.dump([{"view": dataset[int(k)]["view"], "datetimes": dataset[int(k)]["datetimes"]}
+                       for k in preview_idx[:min(args.grid_size, args.num_images)]], f, indent=2)
 
     grid_images = []
     for i in range(num_steps):
@@ -116,14 +115,14 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
         start_idx = world_size * batch_size * i + local_rank * batch_size
         end_idx = start_idx + batch_size
-        labels_gen = class_label_gen_world[start_idx:end_idx]
-        labels_gen = torch.Tensor(labels_gen).long().cuda()
+        batch = default_collate([load_preview_sample(dataset, int(k), args.seed) for k in preview_idx[start_idx:end_idx]])
+        I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask = [t.cuda() for t in batch["tensors"]]
 
         # fixed noise per batch so samples are comparable across epochs; fork_rng leaves the training RNG untouched
         with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
             torch.manual_seed(args.seed + world_size * i + local_rank)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                sampled_images = model_without_ddp.generate(labels_gen)
+                sampled_images = model_without_ddp.generate(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
 
         torch.distributed.barrier()
 
@@ -136,7 +135,10 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
             img_id = i * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
             if img_id >= args.num_images:
                 break
-            if len(grid_images) < args.grid_size:
+            if len(grid_images) < 4 * args.grid_size:
+                # one grid row per sample: It_prev | I0 | It (ground truth) | It (forecast)
+                for frame in (It_prev[b_id], I0[b_id], It[b_id]):
+                    grid_images.append(((frame.float().cpu() + 1) / 2).clamp(0, 1))
                 grid_images.append(sampled_images[b_id].clamp(0, 1))
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
@@ -150,8 +152,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
     # sample grid from rank 0, saved next to the image folder so it survives the FID cleanup
     if misc.is_main_process() and len(grid_images) > 0:
-        nrow = images_per_class if images_per_class is not None else math.ceil(math.sqrt(len(grid_images)))
-        grid = torchvision.utils.make_grid(grid_images, nrow=nrow, padding=2)
+        grid = torchvision.utils.make_grid(grid_images, nrow=4, padding=2)
         torchvision.utils.save_image(grid, save_folder + "-grid.png")
         if log_writer is not None:
             log_writer.add_image('samples', grid, epoch)
