@@ -95,6 +95,30 @@ def load_sample(dataset, index, seed):
         return dataset[index]
 
 
+def match_panorama_widths(samples, camera, tolerance=0.02):
+    """
+    Full panoramas of one camera can differ in width by a few pixels (source image sizes over the camera's history,
+    rounding in the aspect-preserving resize), so their frames cannot be stacked. Resizes every image-sized tensor
+    (frames, angle_mask, view_mask) to the most common width; weather fields are left untouched.
+    """
+    widths = [t.shape[-1] for s in samples for t in s['tensors'] if t.ndim == 3 and t.shape[-2] == s['tensors'][0].shape[-2]]
+    target = max(set(widths), key=widths.count)
+    if max(abs(w - target) for w in widths) > tolerance * target:
+        print('  WARNING: {} panorama widths range from {} to {} px: the field of view may have changed over time'.format(
+            camera, min(widths), max(widths)))
+
+    def resize(t):
+        if t.ndim != 3 or t.shape[-1] == target:
+            return t
+        return torch.nn.functional.interpolate(t[None].float(), size=(t.shape[-2], target), mode='bilinear',
+                                               align_corners=False, antialias=True)[0]
+
+    for s in samples:
+        H = s['tensors'][0].shape[-2]
+        s['tensors'] = tuple(resize(t) if t.ndim == 3 and t.shape[-2] == H else t for t in s['tensors'])
+    return samples
+
+
 @torch.no_grad()
 def generate_tiled(model, I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask, tile=256, stride=128, tile_batch=64):
     """
@@ -245,6 +269,8 @@ def main(args):
             rng = np.random.default_rng(args.seed)
             idx = rng.choice(len(dataset), size=min(args.num_samples, len(dataset)), replace=False)
             samples = [load_sample(dataset, int(i), args.seed) for i in idx]
+            if mode == 'panorama':
+                samples = match_panorama_widths(samples, camera)
             tensors = [torch.stack([s['tensors'][k] for s in samples]).to(device) for k in range(len(samples[0]['tensors']))]
             data[camera] = (samples, tensors)
 
