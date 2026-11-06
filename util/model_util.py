@@ -83,7 +83,24 @@ class VisionRotaryEmbedding(nn.Module):
         return torch.cat((t_left, t, t_right), dim = -1)
 
 
+def circular_freqs(freqs, period):
+    """
+    Rounds angular frequencies (rad per position) to the nearest ones that are periodic over `period` positions,
+    2 pi k / period with integer k, i.e. a whole number of cycles around a 360 deg panorama. The spectrum of the
+    standard frequencies is kept: frequencies below half a cycle per panorama round to k = 0 (no rotation,
+    position-free channels, as the standard low frequencies nearly are over the grid).
+    """
+    k = np.round(np.asarray(freqs, dtype=np.float64) * period / (2 * np.pi))
+    return 2 * np.pi * k / period
+
+
 class VisionRotaryEmbeddingFast(nn.Module):
+    """
+    2D axial RoPE over a token grid of pt_seq_len = (h, w) (or an int for a square grid): the first half of the
+    rotated dimensions encodes the row, the second half the column. With circular_w, the column frequencies are
+    integer multiples of 2 pi / w, so the rotation is periodic in the column: token w-1 and token 0 are neighbours
+    (360 deg panoramas). num_cls_token in-context tokens are prepended with the identity rotation.
+    """
     def __init__(
         self,
         dim,
@@ -94,7 +111,8 @@ class VisionRotaryEmbeddingFast(nn.Module):
         theta = 10000,
         max_freq = 10,
         num_freqs = 1,
-        num_cls_token = 0
+        num_cls_token = 0,
+        circular_w = False
     ):
         super().__init__()
         if custom_freqs:
@@ -108,12 +126,17 @@ class VisionRotaryEmbeddingFast(nn.Module):
         else:
             raise ValueError(f'unknown modality {freqs_for}')
 
-        if ft_seq_len is None: ft_seq_len = pt_seq_len
-        t = torch.arange(ft_seq_len) / ft_seq_len * pt_seq_len
+        h, w = (pt_seq_len, pt_seq_len) if isinstance(pt_seq_len, int) else pt_seq_len
+        if ft_seq_len is None: ft_seq_len = (h, w)
+        ft_h, ft_w = (ft_seq_len, ft_seq_len) if isinstance(ft_seq_len, int) else ft_seq_len
 
-        freqs = torch.einsum('..., f -> ... f', t, freqs)
-        freqs = repeat(freqs, '... n -> ... (n r)', r = 2)
-        freqs = broadcat((freqs[:, None, :], freqs[None, :, :]), dim = -1)
+        freqs_w = torch.from_numpy(circular_freqs(freqs.numpy(), ft_w)).float() if circular_w else freqs
+        t_h = torch.arange(ft_h) / ft_h * h
+        t_w = torch.arange(ft_w) if circular_w else torch.arange(ft_w) / ft_w * w
+
+        freqs_h = repeat(torch.einsum('..., f -> ... f', t_h, freqs), '... n -> ... (n r)', r = 2)
+        freqs_w = repeat(torch.einsum('..., f -> ... f', t_w, freqs_w), '... n -> ... (n r)', r = 2)
+        freqs = broadcat((freqs_h[:, None, :], freqs_w[None, :, :]), dim = -1)  # [h, w, D]
 
         if num_cls_token > 0:
             freqs_flat = freqs.view(-1, freqs.shape[-1])  # [N_img, D]
@@ -151,45 +174,50 @@ class RMSNorm(nn.Module):
         return (self.weight * hidden_states).to(input_dtype)
 
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, circular_w=False):
     """
-    grid_size: int of the grid height and width
+    grid_size: int of the grid height and width, or (h, w)
+    circular_w: the column embedding is periodic over w (360 deg panoramas)
     return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    pos_embed: [h*w, embed_dim] or [extra_tokens+h*w, embed_dim] (w/ or w/o cls_token)
     """
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
+    h, w = (grid_size, grid_size) if isinstance(grid_size, int) else grid_size
+    grid_h = np.arange(h, dtype=np.float32)
+    grid_w = np.arange(w, dtype=np.float32)
     grid = np.meshgrid(grid_w, grid_h)  # here w goes first
     grid = np.stack(grid, axis=0)
 
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    grid = grid.reshape([2, 1, h, w])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid, w_period=w if circular_w else None)
     if cls_token and extra_tokens > 0:
         pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
     return pos_embed
 
 
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid, w_period=None):
     assert embed_dim % 2 == 0
 
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+    # half of the dimensions encode grid[0] (the column), the other half grid[1] (the row)
+    omega_w = circular_freqs(1. / 10000 ** (np.arange(embed_dim // 4) / (embed_dim / 4.)), w_period) if w_period else None
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0], omega=omega_w)  # (H*W, D/2)
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
 
-    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+    emb = np.concatenate([emb_w, emb_h], axis=1) # (H*W, D)
     return emb
 
 
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos, omega=None):
     """
     embed_dim: output dimension for each position
     pos: a list of positions to be encoded: size (M,)
+    omega: (D/2,) frequencies, default 1 / 10000^(2i/D)
     out: (M, D)
     """
     assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000**omega  # (D/2,)
+    if omega is None:
+        omega = np.arange(embed_dim // 2, dtype=np.float64)
+        omega /= embed_dim / 2.
+        omega = 1. / 10000**omega  # (D/2,)
 
     pos = pos.reshape(-1)  # (M,)
     out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product

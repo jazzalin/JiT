@@ -10,7 +10,7 @@ class Denoiser(nn.Module):
     ):
         super().__init__()
         self.net = JiT_models[args.model](
-            input_size=args.img_size,
+            input_size=args.img_size,  # int (square) or [H, W]
             in_channels=3,
             cond_channels=args.cond_channels,
             weather_channels=args.weather_channels,
@@ -19,8 +19,9 @@ class Denoiser(nn.Module):
             weather_patch_size=args.weather_patch_size,
             attn_drop=args.attn_dropout,
             proj_drop=args.proj_dropout,
+            circular_rope=getattr(args, 'circular_rope', False),
         )
-        self.img_size = args.img_size
+        self.img_size = self.net.input_size  # (H, W)
 
         self.P_mean = args.P_mean
         self.P_std = args.P_std
@@ -102,7 +103,7 @@ class Denoiser(nn.Module):
         cond, w = self.make_conditioning(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
         device = I0.device
         bsz = I0.size(0)
-        z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
+        z = self.noise_scale * torch.randn(bsz, 3, *I0.shape[-2:], device=device)
         timesteps = torch.linspace(0.0, 1.0, self.steps+1, device=device).view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1)
 
         if self.method == "euler":

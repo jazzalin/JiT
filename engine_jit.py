@@ -79,10 +79,11 @@ def evaluate(model_without_ddp, dataset, args, epoch, batch_size=64, log_writer=
     num_steps = math.ceil(args.num_images / (batch_size * world_size))
 
     # Construct the folder name for saving generated images.
+    img_size = args.img_size if isinstance(args.img_size, int) else 'x'.join(map(str, args.img_size))
     save_folder = os.path.join(
         args.output_dir,
         "{}-steps{}-cfg{}-image{}-res{}-ema{}-epoch{:03d}".format(
-            model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale, args.num_images, args.img_size,
+            model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale, args.num_images, img_size,
             args.sample_ema, epoch
         )
     )
@@ -152,7 +153,9 @@ def evaluate(model_without_ddp, dataset, args, epoch, batch_size=64, log_writer=
 
     # sample grid from rank 0, saved next to the image folder so it survives the FID cleanup
     if misc.is_main_process() and len(grid_images) > 0:
-        grid = torchvision.utils.make_grid(grid_images, nrow=4, padding=2)
+        # square crops: one row per sample; panoramas are wide, so their four frames are stacked vertically
+        panorama = grid_images[0].shape[-1] > grid_images[0].shape[-2]
+        grid = torchvision.utils.make_grid(grid_images, nrow=1 if panorama else 4, padding=2)
         torchvision.utils.save_image(grid, save_folder + "-grid.png")
         if log_writer is not None:
             log_writer.add_image('samples', grid, epoch)

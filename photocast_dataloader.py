@@ -441,8 +441,17 @@ def get_photocast_transforms(cfg, crop="center"):
     Image transforms shared by training and evaluation (output in [-1, 1]).
     crop: "center" for a fixed crop at the panorama center, i.e. the North-facing view after PanoramaNorthRoll,
     "random" for a crop at a random heading (same crop for all frames and masks of a sample),
-    None to keep the full panorama (resized to the crop height)
+    "panorama" to resize the full 360 deg panorama to exactly img_size, e.g. (256, 2048), so every column
+    maps to the same heading for every camera,
+    None to keep the full panorama (resized to the crop height, aspect preserved)
     """
+
+    if crop == "panorama":
+        return v2.Compose([
+            v2.Resize(tuple(cfg['data']['img_size']), interpolation=v2.InterpolationMode.BICUBIC, antialias=True),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
 
     crops = {
         "center": v2.CenterCrop(cfg['data']['img_size']),
@@ -466,7 +475,8 @@ def get_photocast_dataloader(cfg):
     "tensors": (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask).
     """
 
-    transforms = get_photocast_transforms(cfg, crop="random")
+    # "random": img_size crops at a random heading; "panorama": full panoramas resized to img_size
+    transforms = get_photocast_transforms(cfg, crop=cfg["data"].get("train_crop", "random"))
 
     shared_weather = xr.open_zarr(os.path.join(cfg["data"]["weather_root_dir"], "inca.zarr"), consolidated=True, chunks=None)
 

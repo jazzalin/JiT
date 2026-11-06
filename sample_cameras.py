@@ -2,9 +2,12 @@
 Forecast It for selected cameras with a trained JiT conditioned on (I0, It_prev) and the weather (wt, w0, wt_prev).
 
 For every camera, a fixed random set of (It_prev, I0, It) triples is forecast with --num_seeds noise seeds per EMA,
-either on 256x256 crops (the training resolution) or on full panoramas. Full panoramas are sampled by tiling:
-at every ODE step the model denoises overlapping 256x256 crops around the 360 deg panorama (wrapping at the seam,
-each crop with its own angle_mask) and the overlapping velocity predictions are averaged (MultiDiffusion).
+either on 256x256 crops (the training resolution) or on full panoramas.
+- Models trained on full panoramas (e.g. --img_size 256 2048) sample the panorama in one pass at the training size
+  (panorama mode only).
+- Models trained on 256x256 crops sample full panoramas by tiling: at every ODE step the model denoises overlapping
+  256x256 crops around the 360 deg panorama (wrapping at the seam, each crop with its own angle_mask) and the
+  overlapping velocity predictions are averaged (MultiDiffusion).
 
 Outputs, per mode (crop / panorama):
   - grids/<camera>.png: per camera, the conditioning frames, the ground truth and the forecasts of every sample
@@ -230,7 +233,15 @@ def main(args):
     train_args.sampling_method = args.sampling_method
     train_args.num_sampling_steps = args.num_sampling_steps
     model = Denoiser(train_args).to(device).eval()
-    tile = train_args.img_size
+    # image size from the checkpoint, not the config: (H, H) for crop models, e.g. (256, 2048) for panorama models
+    img_h, img_w = model.img_size
+    panorama_model = img_w > img_h
+    cfg['data']['img_size'] = [img_h, img_w]
+    tile = img_h
+    print('Model trained on {}x{} {}'.format(img_h, img_w, 'panoramas' if panorama_model else 'crops'))
+    if panorama_model and 'crop' in args.mode:
+        print('WARNING: skipping crop mode, the model was trained on full panoramas')
+        args.mode = [m for m in args.mode if m != 'crop']
 
     cameras = args.cameras
     if not cameras:
@@ -249,7 +260,11 @@ def main(args):
 
     for mode in args.mode:
         mode_dir = os.path.join(output_dir, mode if mode == 'panorama' else 'crop-{}'.format(args.crop))
-        transform = get_photocast_transforms(cfg, crop=args.crop if mode == 'crop' else None)
+        if mode == 'crop':
+            transform = get_photocast_transforms(cfg, crop=args.crop)
+        else:
+            # panorama models: resized to the training size; crop models: native aspect, tiled
+            transform = get_photocast_transforms(cfg, crop='panorama' if panorama_model else None)
 
         # load the conditioning and ground truth of every camera once
         data = {}  # camera -> (list of samples, batched tensors on the device)
@@ -290,7 +305,7 @@ def main(args):
                 cond = [x.repeat_interleave(args.num_seeds, dim=0) for x in (I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)]
                 torch.manual_seed(args.seed)
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    if mode == 'crop':
+                    if mode == 'crop' or panorama_model:
                         x = model.generate(*cond)
                     else:
                         x = generate_tiled(model, *cond, tile=tile, stride=args.tile_stride, tile_batch=args.tile_batch)

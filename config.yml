@@ -67,9 +67,11 @@ data:
   - 128
   - 1024
   image_root_dir: ./data
+  # full 360 deg panoramas resized to 256 x 2048 (train_crop: random for 256 x 256 crops at a random heading)
   img_size:
   - 256
-  - 256
+  - 2048
+  train_crop: panorama
   num_workers: 40
   viewshed_radius: 8000
   train:

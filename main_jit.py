@@ -30,7 +30,12 @@ def get_args_parser():
     # architecture
     parser.add_argument('--model', default='JiT-B/16', type=str, metavar='MODEL',
                         help='Name of the model to train')
-    parser.add_argument('--img_size', default=256, type=int, help='Image size')
+    parser.add_argument('--img_size', default=None, type=int, nargs='+',
+                        help='Image size: S for SxS crops, or H W (e.g. 256 2048 for full panoramas). '
+                             'Default: taken from the data (data.img_size / data.train_crop in the config); '
+                             'if given, it must match the data')
+    parser.add_argument('--circular_rope', action='store_true',
+                        help='Column RoPE and sincos pos_embed periodic over the width (360 deg panoramas wrap around)')
     parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
     parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
 
@@ -158,6 +163,16 @@ def main(args):
 
     # conditioning sizes from one sample: (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
     I0, _, It_prev, w0, wt, wt_prev, angle_mask, view_mask = dataset_train[0]["tensors"]
+    data_size = list(I0.shape[1:])
+    if args.img_size is None:
+        img_size = data_size
+    else:
+        img_size = args.img_size * 2 if len(args.img_size) == 1 else args.img_size
+        assert data_size == img_size, \
+            "--img_size {} does not match the data ({}): drop --img_size or set data.img_size / data.train_crop in {}".format(
+                img_size, data_size, args.config)
+    print("Image size: {}x{}".format(*img_size))
+    args.img_size = img_size[0] if img_size[0] == img_size[1] else img_size
     args.cond_channels = I0.shape[0] + It_prev.shape[0] + angle_mask.shape[0] + view_mask.shape[0]
     args.weather_channels = w0.shape[0]  # per time step, the embedder is shared across (wt, w0, wt_prev)
     args.weather_times = 3

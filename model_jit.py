@@ -19,9 +19,12 @@ class BottleneckPatchEmbed(nn.Module):
     """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True):
         super().__init__()
-        img_size = (img_size, img_size)
+        img_size = (img_size, img_size) if isinstance(img_size, int) else tuple(img_size)
         patch_size = (patch_size, patch_size)
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+        assert img_size[0] % patch_size[0] == 0 and img_size[1] % patch_size[1] == 0, \
+            f"image size {img_size} must be a multiple of the patch size {patch_size}"
+        self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
+        num_patches = self.grid_size[0] * self.grid_size[1]
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
@@ -209,7 +212,8 @@ class JiT(nn.Module):
         attn_drop=0.0,
         proj_drop=0.0,
         bottleneck_dim=128,
-        in_context_start=8
+        in_context_start=8,
+        circular_rope=False
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -217,14 +221,17 @@ class JiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.hidden_size = hidden_size
-        self.input_size = input_size
+        # (H, W): 256 for square crops, (256, 2048) for full panoramas
+        self.input_size = (input_size, input_size) if isinstance(input_size, int) else tuple(input_size)
+        # column position (RoPE and sincos pos_embed) periodic over the width, for 360 deg panoramas
+        self.circular_rope = circular_rope
         self.in_context_start = in_context_start
 
         # time embed
         self.t_embedder = TimestepEmbedder(hidden_size)
 
         # linear embed of the noisy image channel-concatenated with the conditioning frames
-        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels + cond_channels, bottleneck_dim, hidden_size, bias=True)
+        self.x_embedder = BottleneckPatchEmbed(self.input_size, patch_size, in_channels + cond_channels, bottleneck_dim, hidden_size, bias=True)
 
         # weather fields are patchified into in-context tokens by an embedder shared across time steps;
         # a learned time-slot embedding (one per weather time) tells the time steps apart
@@ -244,16 +251,18 @@ class JiT(nn.Module):
 
         # rope
         half_head_dim = hidden_size // num_heads // 2
-        hw_seq_len = input_size // patch_size
+        grid_size = self.x_embedder.grid_size
         self.feat_rope = VisionRotaryEmbeddingFast(
             dim=half_head_dim,
-            pt_seq_len=hw_seq_len,
-            num_cls_token=0
+            pt_seq_len=grid_size,
+            num_cls_token=0,
+            circular_w=circular_rope
         )
         self.feat_rope_incontext = VisionRotaryEmbeddingFast(
             dim=half_head_dim,
-            pt_seq_len=hw_seq_len,
-            num_cls_token=self.in_context_len
+            pt_seq_len=grid_size,
+            num_cls_token=self.in_context_len,
+            circular_w=circular_rope
         )
 
         # transformer
@@ -279,10 +288,10 @@ class JiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.x_embedder.grid_size, circular_w=self.circular_rope)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        w_pos_embed = get_2d_sincos_pos_embed(self.w_pos_embed.shape[-1], int(self.w_embedder.num_patches ** 0.5))
+        w_pos_embed = get_2d_sincos_pos_embed(self.w_pos_embed.shape[-1], self.w_embedder.grid_size)
         self.w_pos_embed.data.copy_(torch.from_numpy(w_pos_embed).float()[None, None])
         nn.init.normal_(self.w_time_embed, std=.02)
         nn.init.normal_(self.w_null, std=.02)
@@ -316,12 +325,12 @@ class JiT(nn.Module):
         imgs: (N, H, W, C)
         """
         c = self.out_channels
-        h = w = int(x.shape[1] ** 0.5)
+        h, w = self.x_embedder.grid_size
         assert h * w == x.shape[1]
 
         x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
     def forward(self, x, t, cond, w, w_drop=None):
