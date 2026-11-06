@@ -16,6 +16,23 @@ import torch_fidelity
 import copy
 
 
+def host_memory_gb():
+    """Proportional set size (shared pages split between processes) of this process and its dataloader workers, in GB"""
+    try:
+        import psutil
+        procs = [psutil.Process()]
+        procs += procs[0].children(recursive=True)
+        total = 0
+        for p in procs:
+            try:
+                total += p.memory_full_info().pss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return total / 1e9
+    except ImportError:
+        return float('nan')
+
+
 def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, epoch, log_writer=None, args=None):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -62,6 +79,9 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
             if data_iter_step % args.log_freq == 0:
                 log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
                 log_writer.add_scalar('lr', lr, epoch_1000x)
+                host_mem = host_memory_gb()
+                log_writer.add_scalar('host_mem_gb', host_mem, epoch_1000x)
+                metric_logger.update(host_mem_gb=host_mem)
 
 
 def load_preview_sample(dataset, index, seed):

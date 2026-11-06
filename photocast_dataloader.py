@@ -322,6 +322,13 @@ class Photocast2DDatasetZarr(Dataset):
         # Generate index
         self.pairs, self.dst = generate_training_three_tuples(self, lead_times=lead_times, reference_times=reference_times)
 
+        # Per-image fields read in __getitem__, as plain numpy arrays: indexing the object (string) columns of
+        # self.data from forked dataloader workers touches Python refcounts, which copies the DataFrame pages into
+        # every worker over time (host memory grows until the job is OOM killed)
+        self.paths = self.data["path"].to_numpy(dtype=str).astype(np.bytes_)  # fixed-width bytes, 1 byte per character
+        self.times = self.data.index.to_numpy()
+        self.cam = str(self.data["cam"].iloc[0])
+
     def __len__(self):
         return len(self.pairs)
 
@@ -391,14 +398,15 @@ class Photocast2DDatasetZarr(Dataset):
         It_prev_idx, I0_idx, It_idx = self.pairs[index]
 
         # Load images: prev image (24h before target), current image, target image
-        It_prev = F.to_image(Img.open(os.path.join(self.image_root_dir, self.data["path"].iloc[It_prev_idx])))
-        I0 = F.to_image(Img.open(os.path.join(self.image_root_dir, self.data["path"].iloc[I0_idx])))
-        It = F.to_image(Img.open(os.path.join(self.image_root_dir, self.data["path"].iloc[It_idx])))
+        It_prev = F.to_image(Img.open(os.path.join(self.image_root_dir, self.paths[It_prev_idx].decode())))
+        I0 = F.to_image(Img.open(os.path.join(self.image_root_dir, self.paths[I0_idx].decode())))
+        It = F.to_image(Img.open(os.path.join(self.image_root_dir, self.paths[It_idx].decode())))
 
         # Crop corresponding 2D weather maps
-        wt_prev = self.get_weather_crop(self.data.index[It_prev_idx])
-        w0 = self.get_weather_crop(self.data.index[I0_idx])
-        wt = self.get_weather_crop(self.data.index[It_idx])
+        times = [pd.Timestamp(self.times[i]) for i in (It_prev_idx, I0_idx, It_idx)]
+        wt_prev = self.get_weather_crop(times[0])
+        w0 = self.get_weather_crop(times[1])
+        wt = self.get_weather_crop(times[2])
 
         # Expand panorama to 360 FOV, keeping track of the expanded region with a mask image
         _, H, W = F.get_dimensions(I0)
@@ -431,8 +439,8 @@ class Photocast2DDatasetZarr(Dataset):
 
         sample = {}
         sample["tensors"] = (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
-        sample["view"] = self.data["cam"].iloc[I0_idx]
-        sample["datetimes"] = [dt.strftime('%Y-%m-%d_%H:%M') for dt in self.data.index[[It_prev_idx, I0_idx, It_idx]]]
+        sample["view"] = self.cam
+        sample["datetimes"] = [dt.strftime('%Y-%m-%d_%H:%M') for dt in times]
 
         return sample
 

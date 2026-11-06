@@ -22,4 +22,5 @@ dependencies:
       - xarray==2023.12.0
       - zarr==2.16.1
       - netCDF4==1.6.5
+      - psutil
       - torch-fidelity @ git+https://github.com/LTH14/torch-fidelity.git@master
