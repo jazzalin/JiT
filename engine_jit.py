@@ -136,30 +136,38 @@ def evaluate(model_without_ddp, dataset, args, epoch, batch_size=64, log_writer=
 
         start_idx = world_size * batch_size * i + local_rank * batch_size
         end_idx = start_idx + batch_size
-        batch = default_collate([load_preview_sample(dataset, int(k), args.seed) for k in preview_idx[start_idx:end_idx]])
-        I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask = [t.cuda() for t in batch["tensors"]]
+        samples = [load_preview_sample(dataset, int(k), args.seed) for k in preview_idx[start_idx:end_idx]]
 
-        # fixed noise per batch so samples are comparable across epochs; fork_rng leaves the training RNG untouched
-        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-            torch.manual_seed(args.seed + world_size * i + local_rank)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                sampled_images = model_without_ddp.generate(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
+        # samples of different sizes (native field of view panoramas) are generated in groups of one size
+        groups = {}
+        for j, s in enumerate(samples):
+            groups.setdefault(tuple(s["tensors"][0].shape), []).append(j)
+        sampled_images = [None] * len(samples)
+        for g, members in enumerate(groups.values()):
+            batch = default_collate([samples[j] for j in members])
+            I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask = [t.cuda() for t in batch["tensors"]]
+            # fixed noise per batch so samples are comparable across epochs; fork_rng leaves the training RNG untouched
+            with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+                torch.manual_seed(args.seed + world_size * i + local_rank + 1000003 * g)
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    x = model_without_ddp.generate(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
+            # denormalize images
+            x = ((x.float() + 1) / 2).detach().cpu()
+            for j, img in zip(members, x):
+                sampled_images[j] = img
 
         torch.distributed.barrier()
 
-        # denormalize images
-        sampled_images = (sampled_images + 1) / 2
-        sampled_images = sampled_images.detach().cpu()
-
         # distributed save images
-        for b_id in range(sampled_images.size(0)):
-            img_id = i * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
+        for b_id in range(len(samples)):
+            img_id = i * batch_size * world_size + local_rank * batch_size + b_id
             if img_id >= args.num_images:
                 break
             if len(grid_images) < 4 * args.grid_size:
                 # one grid row per sample: It_prev | I0 | It (ground truth) | It (forecast)
-                for frame in (It_prev[b_id], I0[b_id], It[b_id]):
-                    grid_images.append(((frame.float().cpu() + 1) / 2).clamp(0, 1))
+                I0, It, It_prev = samples[b_id]["tensors"][:3]
+                for frame in (It_prev, I0, It):
+                    grid_images.append(((frame.float() + 1) / 2).clamp(0, 1))
                 grid_images.append(sampled_images[b_id].clamp(0, 1))
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
@@ -174,7 +182,10 @@ def evaluate(model_without_ddp, dataset, args, epoch, batch_size=64, log_writer=
     # sample grid from rank 0, saved next to the image folder so it survives the FID cleanup
     if misc.is_main_process() and len(grid_images) > 0:
         # square crops: one row per sample; panoramas are wide, so their four frames are stacked vertically
-        panorama = grid_images[0].shape[-1] > grid_images[0].shape[-2]
+        # (padded with white to the widest panorama when widths differ)
+        panorama = any(g.shape[-1] > g.shape[-2] for g in grid_images)
+        max_w = max(g.shape[-1] for g in grid_images)
+        grid_images = [torch.nn.functional.pad(g, (0, max_w - g.shape[-1]), value=1.0) for g in grid_images]
         grid = torchvision.utils.make_grid(grid_images, nrow=1 if panorama else 4, padding=2)
         torchvision.utils.save_image(grid, save_folder + "-grid.png")
         if log_writer is not None:

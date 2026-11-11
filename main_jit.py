@@ -8,13 +8,12 @@ from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
 from util.crop import center_crop_arr
 import util.misc as misc
-from util.sampler import RandomSubsetSampler
+from util.sampler import RandomSubsetSampler, WidthBinBatchSampler
 
 import copy
 from engine_jit import train_one_epoch, evaluate
@@ -36,6 +35,9 @@ def get_args_parser():
                              'if given, it must match the data')
     parser.add_argument('--circular_rope', action='store_true',
                         help='Column RoPE and sincos pos_embed periodic over the width (360 deg panoramas wrap around)')
+    # --cylindrical is set automatically for native field of view data (data.train_crop: native)
+    parser.add_argument('--cylindrical', action='store_true',
+                        help='Panoramas of any width: position embedding and column RoPE from each column azimuth')
     parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
     parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
 
@@ -154,19 +156,26 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
-    # Set up TensorBoard logging (only on main process)
+    # TensorBoard logging disabled
     if global_rank == 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.output_dir)
-    else:
-        log_writer = None
+    log_writer = None
 
     dataset_train = get_photocast_dataloader(config)
 
     # conditioning sizes from one sample: (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
     I0, _, It_prev, w0, wt, wt_prev, angle_mask, view_mask = dataset_train[0]["tensors"]
     data_size = list(I0.shape[1:])
-    if args.img_size is None:
+    native = getattr(dataset_train, "widths", None) is not None
+    if native:
+        # native field of view: one width per camera, the model takes any width (multiple of the patch size)
+        args.cylindrical = True
+        assert not args.circular_rope, "--circular_rope does not apply to native field of view panoramas"
+        widths = np.unique(dataset_train.widths)
+        print("Native field of view panoramas: height {}, {} widths from {} to {} (cylindrical model)".format(
+            data_size[0], len(widths), widths.min(), widths.max()))
+        img_size = [data_size[0], data_size[0]]  # the model's fixed size is the height only
+    elif args.img_size is None:
         img_size = data_size
     else:
         img_size = args.img_size * 2 if len(args.img_size) == 1 else args.img_size
@@ -189,7 +198,15 @@ def main(args):
         with open(os.path.join(args.output_dir, "cameras.json"), "w") as f:
             json.dump(dataset_train.cameras, f, indent=2)
 
-    if args.steps_per_epoch > 0:
+    batch_sampler_train = None
+    if native:
+        # batches of one width; fixed-length epochs with steps_per_epoch > 0
+        batch_sampler_train = WidthBinBatchSampler(
+            dataset_train.widths, args.batch_size, num_batches=args.steps_per_epoch or None,
+            num_replicas=num_tasks, rank=global_rank, seed=args.seed
+        )
+        sampler_train = None
+    elif args.steps_per_epoch > 0:
         # fixed-length epochs: a new random subset of steps_per_epoch batches per GPU each epoch
         sampler_train = RandomSubsetSampler(
             dataset_train, num_samples=args.steps_per_epoch * args.batch_size,
@@ -199,17 +216,15 @@ def main(args):
         sampler_train = torch.utils.data.DistributedSampler(
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
-    print("Sampler_train =", sampler_train)
+    print("Sampler_train =", batch_sampler_train or sampler_train)
 
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-        prefetch_factor=args.prefetch_factor,
-        pin_memory=args.pin_mem,
-        drop_last=True
-    )
+    loader_kwargs = dict(num_workers=args.num_workers, persistent_workers=True,
+                         prefetch_factor=args.prefetch_factor, pin_memory=args.pin_mem)
+    if batch_sampler_train is not None:
+        data_loader_train = torch.utils.data.DataLoader(dataset_train, batch_sampler=batch_sampler_train, **loader_kwargs)
+    else:
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train, sampler=sampler_train, batch_size=args.batch_size, drop_last=True, **loader_kwargs)
 
     torch._dynamo.config.cache_size_limit = 128
     torch._dynamo.config.optimize_ddp = False
@@ -275,7 +290,7 @@ def main(args):
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         # both samplers reshuffle per epoch only through set_epoch, so call it even on a single GPU
-        data_loader_train.sampler.set_epoch(epoch)
+        (batch_sampler_train or data_loader_train.sampler).set_epoch(epoch)
 
         train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
 

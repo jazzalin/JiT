@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
-from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
+from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm, rotate_half, \
+    CylindricalPosEmbed, patch_azimuths, cylindrical_rope
 
 
 def modulate(x, shift, scale):
@@ -17,7 +18,7 @@ def modulate(x, shift, scale):
 class BottleneckPatchEmbed(nn.Module):
     """ Image to Patch Embedding
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True, strict_width=True):
         super().__init__()
         img_size = (img_size, img_size) if isinstance(img_size, int) else tuple(img_size)
         patch_size = (patch_size, patch_size)
@@ -28,14 +29,20 @@ class BottleneckPatchEmbed(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
+        # strict_width=False: any width that is a multiple of the patch size (panoramas of any field of view)
+        self.strict_width = strict_width
 
         self.proj1 = nn.Conv2d(in_chans, pca_dim, kernel_size=patch_size, stride=patch_size, bias=False)
         self.proj2 = nn.Conv2d(pca_dim, embed_dim, kernel_size=1, stride=1, bias=bias)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        if self.strict_width:
+            assert H == self.img_size[0] and W == self.img_size[1], \
+                f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        else:
+            assert H == self.img_size[0] and W % self.patch_size[1] == 0, \
+                f"Input image size ({H}*{W}): height must be {self.img_size[0]}, width a multiple of {self.patch_size[1]}."
         x = self.proj2(self.proj1(x)).flatten(2).transpose(1, 2)
         return x
 
@@ -115,8 +122,13 @@ class Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        q = rope(q)
-        k = rope(k)
+        if isinstance(rope, tuple):
+            cos, sin = (r.unsqueeze(1).to(q.dtype) for r in rope)  # (B, 1, N, D), broadcast over heads
+            q = q * cos + rotate_half(q) * sin
+            k = k * cos + rotate_half(k) * sin
+        else:
+            q = rope(q)
+            k = rope(k)
 
         x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
 
@@ -213,7 +225,9 @@ class JiT(nn.Module):
         proj_drop=0.0,
         bottleneck_dim=128,
         in_context_start=8,
-        circular_rope=False
+        circular_rope=False,
+        cylindrical=False,
+        turn_tokens=48
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -225,13 +239,19 @@ class JiT(nn.Module):
         self.input_size = (input_size, input_size) if isinstance(input_size, int) else tuple(input_size)
         # column position (RoPE and sincos pos_embed) periodic over the width, for 360 deg panoramas
         self.circular_rope = circular_rope
+        # panoramas of any width: position embedding and column RoPE from each column's azimuth (0 = North),
+        # patch grid from the input; input_size only sets the height
+        self.cylindrical = cylindrical
+        self.turn_tokens = turn_tokens
+        assert not (circular_rope and cylindrical), "circular_rope and cylindrical are exclusive"
         self.in_context_start = in_context_start
 
         # time embed
         self.t_embedder = TimestepEmbedder(hidden_size)
 
         # linear embed of the noisy image channel-concatenated with the conditioning frames
-        self.x_embedder = BottleneckPatchEmbed(self.input_size, patch_size, in_channels + cond_channels, bottleneck_dim, hidden_size, bias=True)
+        self.x_embedder = BottleneckPatchEmbed(self.input_size, patch_size, in_channels + cond_channels, bottleneck_dim, hidden_size, bias=True,
+                                               strict_width=not cylindrical)
 
         # weather fields are patchified into in-context tokens by an embedder shared across time steps;
         # a learned time-slot embedding (one per weather time) tells the time steps apart
@@ -246,7 +266,11 @@ class JiT(nn.Module):
 
         # use fixed sin-cos embedding
         num_patches = self.x_embedder.num_patches
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        if cylindrical:
+            self.pos_embed = None
+            self.cyl_pos_embed = CylindricalPosEmbed(hidden_size, self.x_embedder.grid_size[0], patch_size)
+        else:
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
 
         # rope
@@ -288,8 +312,9 @@ class JiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.x_embedder.grid_size, circular_w=self.circular_rope)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        if self.pos_embed is not None:
+            pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.x_embedder.grid_size, circular_w=self.circular_rope)
+            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         w_pos_embed = get_2d_sincos_pos_embed(self.w_pos_embed.shape[-1], self.w_embedder.grid_size)
         self.w_pos_embed.data.copy_(torch.from_numpy(w_pos_embed).float()[None, None])
@@ -319,13 +344,14 @@ class JiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x, p):
+    def unpatchify(self, x, p, grid_size=None):
         """
         x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
+        grid_size: (h, w) patch grid of the input (default: the model's fixed grid)
+        imgs: (N, C, H, W)
         """
         c = self.out_channels
-        h, w = self.x_embedder.grid_size
+        h, w = grid_size or self.x_embedder.grid_size
         assert h * w == x.shape[1]
 
         x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
@@ -333,14 +359,16 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
-    def forward(self, x, t, cond, w, w_drop=None):
+    def forward(self, x, t, cond, w, w_drop=None, angles=None):
         """
         x: (N, C, H, W) noisy image
         t: (N,)
         cond: (N, C_cond, H, W) conditioning frames
         w: (N, T, C_w, H_w, W_w) weather fields at T times
         w_drop: (N,) bool, samples whose weather is replaced by the null weather tokens
+        angles: (N, W) azimuth in radians of every column (cylindrical models only)
         """
+        grid_size = (x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size)
         # weather tokens (shared embedder per time + spatial and time-slot embeddings), pooled into the time embedding for adaLN
         N, T = w.shape[:2]
         w_tokens = self.w_embedder(w.flatten(0, 1)).unflatten(0, (N, T))
@@ -352,18 +380,28 @@ class JiT(nn.Module):
 
         # forward JiT
         x = self.x_embedder(torch.cat([x, cond], dim=1))
-        x += self.pos_embed
+        if self.cylindrical:
+            assert angles is not None, "cylindrical models need the column azimuths"
+            az = patch_azimuths(angles, self.patch_size)  # (N, gw)
+            x = x + self.cyl_pos_embed(az).to(x.dtype)
+            half_head_dim = self.hidden_size // self.num_heads // 2
+            rope = cylindrical_rope(az, grid_size[0], half_head_dim, turn_tokens=self.turn_tokens)
+            rope_incontext = cylindrical_rope(az, grid_size[0], half_head_dim, num_cls_token=self.in_context_len,
+                                              turn_tokens=self.turn_tokens)
+        else:
+            x += self.pos_embed
+            rope, rope_incontext = self.feat_rope, self.feat_rope_incontext
 
         for i, block in enumerate(self.blocks):
             # in-context
             if self.in_context_len > 0 and i == self.in_context_start:
                 x = torch.cat([w_tokens, x], dim=1)
-            x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext)
+            x = block(x, c, rope if i < self.in_context_start else rope_incontext)
 
         x = x[:, self.in_context_len:]
 
         x = self.final_layer(x, c)
-        output = self.unpatchify(x, self.patch_size)
+        output = self.unpatchify(x, self.patch_size, grid_size)
 
         return output
 

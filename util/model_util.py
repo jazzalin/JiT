@@ -227,3 +227,61 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos, omega=None):
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
+
+
+class CylindricalPosEmbed(nn.Module):
+    """
+    Absolute position embedding of panoramas of any width, built from each column's direction:
+    the first half of the dimensions encodes the patch row (1D sin-cos), the second half the patch azimuth with
+    integer harmonics k = 1..max_az_freq (cycles per 360 deg), so the embedding is periodic across North/the seam
+    and the same heading gets the same embedding in every camera, whatever its field of view or resolution.
+    The azimuth of a patch is the circular mean of its columns' azimuths.
+    """
+    def __init__(self, embed_dim, grid_h, patch_size, max_az_freq=32):
+        super().__init__()
+        assert embed_dim % 4 == 0
+        self.patch_size = patch_size
+        row = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, np.arange(grid_h, dtype=np.float32))  # (gh, D/2)
+        self.register_buffer("row_embed", torch.from_numpy(row).float(), persistent=False)
+        k = torch.round(torch.logspace(0, np.log10(max_az_freq), embed_dim // 4))
+        self.register_buffer("az_freqs", k, persistent=False)
+
+    def forward(self, az):
+        """az: (B, gw) patch azimuths in radians -> (B, gh * gw, D), row-major like the patch embedding"""
+        B, gw = az.shape
+        gh = self.row_embed.shape[0]
+        ang = az.float()[..., None] * self.az_freqs                       # (B, gw, D/4)
+        az_emb = torch.cat([ang.sin(), ang.cos()], dim=-1)                # (B, gw, D/2)
+        row = self.row_embed[None, :, None].expand(B, gh, gw, -1)
+        return torch.cat([row, az_emb[:, None].expand(B, gh, gw, -1)], dim=-1).reshape(B, gh * gw, -1)
+
+
+def patch_azimuths(angles, patch_size):
+    """(B, W) column azimuths in radians -> (B, W / patch_size) patch azimuths (circular mean, safe across the wrap)"""
+    B, W = angles.shape
+    a = angles.float().reshape(B, W // patch_size, patch_size)
+    return torch.atan2(a.sin().mean(-1), a.cos().mean(-1))
+
+
+def cylindrical_rope(az, grid_h, dim, num_cls_token=0, turn_tokens=48, theta=10000):
+    """
+    2D axial RoPE tables for panoramas of any width, the column rotation driven by the patch azimuth.
+    Rows use the standard frequencies; for the columns, the standard frequencies (rad per token) are rounded to
+    whole cycles per 360 deg for a nominal turn_tokens patches per 360 deg, so the rotation of a column depends
+    on its heading only: attention between two patches depends on their azimuth difference, wraps around
+    North for 360 deg cameras, and matches across cameras of different resolutions.
+    az: (B, gw) patch azimuths; dim: rotated dims per axis (half the head dim).
+    Returns (cos, sin), each (B, num_cls_token + grid_h * gw, 2 * dim); in-context tokens get the identity.
+    """
+    B, gw = az.shape
+    freqs = 1. / (theta ** (torch.arange(0, dim, 2, device=az.device)[:(dim // 2)].float() / dim))
+    k = torch.round(freqs * turn_tokens / (2 * pi))                          # cycles per 360 deg
+    f_h = repeat(torch.arange(grid_h, device=az.device).float()[:, None] * freqs, '... n -> ... (n r)', r=2)  # (gh, dim)
+    f_w = repeat(az.float()[..., None] * k, '... n -> ... (n r)', r=2)       # (B, gw, dim)
+    f = torch.cat([f_h[None, :, None].expand(B, grid_h, gw, -1), f_w[:, None].expand(B, grid_h, gw, -1)], dim=-1)
+    f = f.reshape(B, grid_h * gw, 2 * dim)
+    cos, sin = f.cos(), f.sin()
+    if num_cls_token > 0:
+        cos = torch.cat([cos.new_ones(B, num_cls_token, 2 * dim), cos], dim=1)
+        sin = torch.cat([sin.new_zeros(B, num_cls_token, 2 * dim), sin], dim=1)
+    return cos, sin

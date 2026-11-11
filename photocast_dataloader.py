@@ -264,7 +264,8 @@ class Photocast2DDatasetZarr(Dataset):
                  img_transform=None,
                  lead_times=[0, 360],
                  reference_times=[(-1, "D")],
-                 date_ranges=None):
+                 date_ranges=None,
+                 native_size=None):
         """
         Args:
             csv_file: Contains information on the timesteps available for training
@@ -277,6 +278,10 @@ class Photocast2DDatasetZarr(Dataset):
             lead_times: minimum and maximum lead times in minutes to include in training triples
             reference_times: list of reference times for samples
             date_ranges: list of [start, end] datetimes (inclusive) of the images to keep, None keeps all
+            native_size: None to expand every panorama to 360 deg and roll North to its center (the masks mark
+                the padding); (H, multiple) to keep the camera's native field of view instead, resized to height H
+                and a fixed width per camera (self.width, from its first image, rounded to a multiple of `multiple`
+                such as the patch size). The angle_mask then holds the azimuth of every column (0 = North).
         """
         self.data = pd.read_csv(csv_file, index_col=0)
         self.data.index = pd.to_datetime(self.data["reference"])
@@ -321,6 +326,17 @@ class Photocast2DDatasetZarr(Dataset):
 
         # Generate index
         self.pairs, self.dst = generate_training_three_tuples(self, lead_times=lead_times, reference_times=reference_times)
+
+        # Native field of view: one width per camera, so that every frame of the camera has the same size
+        self.native_size = native_size
+        self.width = None
+        if native_size is not None:
+            height, multiple = native_size
+            with Img.open(os.path.join(self.image_root_dir, self.data["path"].iloc[0])) as img:
+                w, h = img.size
+            self.width = max(multiple, int(round(w * height / h / multiple)) * multiple)
+            self.angle = float(self.data["angle"].iloc[0])
+            self.north = float(self.data["north"].iloc[0])
 
         # Per-image fields read in __getitem__, as plain numpy arrays: indexing the object (string) columns of
         # self.data from forked dataloader workers touches Python refcounts, which copies the DataFrame pages into
@@ -408,23 +424,35 @@ class Photocast2DDatasetZarr(Dataset):
         w0 = self.get_weather_crop(times[1])
         wt = self.get_weather_crop(times[2])
 
-        # Expand panorama to 360 FOV, keeping track of the expanded region with a mask image
-        _, H, W = F.get_dimensions(I0)
-        view_mask = F.to_image(torch.ones((1, H, W)))
-        I0, It, It_prev, view_mask = self.tf_expand(I0, It, It_prev, view_mask)
+        if self.native_size is not None:
+            # Native field of view, resized to the camera's fixed size: no padding, so the view mask is all ones
+            H, W = self.native_size[0], self.width
+            I0, It, It_prev = (F.resize(I, [H, W], interpolation=v2.InterpolationMode.BICUBIC, antialias=True)
+                               for I in (I0, It, It_prev))
+            view_mask = F.to_image(torch.ones((1, H, W)))
+            # azimuth of every column: the image spans `angle` degrees, North at column north * W
+            azimuth = (torch.arange(W) - self.north * W) * (self.angle / 360.0) * (2 * torch.pi / W)
+            cos = torch.cos(azimuth).unsqueeze(0).expand(H, -1)
+            sin = torch.sin(azimuth).unsqueeze(0).expand(H, -1)
+            angle_mask = F.to_image((torch.stack([cos, sin, torch.zeros_like(sin)], dim=0) + 1.0) / 2.0)
+        else:
+            # Expand panorama to 360 FOV, keeping track of the expanded region with a mask image
+            _, H, W = F.get_dimensions(I0)
+            view_mask = F.to_image(torch.ones((1, H, W)))
+            I0, It, It_prev, view_mask = self.tf_expand(I0, It, It_prev, view_mask)
 
-        # Roll panorama to have North in center
-        I0, It, It_prev, view_mask = self.tf_roll(I0, It, It_prev, view_mask)
+            # Roll panorama to have North in center
+            I0, It, It_prev, view_mask = self.tf_roll(I0, It, It_prev, view_mask)
 
-        # Encode the heading as cos(theta) and sin(theta) frames matching image dimensions,
-        # so the mapping between panorama and weather heading can be learned
-        _, H, W = F.get_dimensions(I0)
-        cos = torch.cos(torch.linspace(0, 2 * torch.pi, W).unsqueeze(0).expand(H, -1))
-        sin = torch.sin(torch.linspace(0, 2 * torch.pi, W).unsqueeze(0).expand(H, -1))
-        angle_mask = torch.stack([cos, sin, torch.zeros_like(sin)], dim=0)
-        angle_mask = (angle_mask + 1.0) / 2.0
-        # Assuming North centered images, roll angle mask to have 0 at half-width
-        angle_mask = F.to_image(torch.roll(angle_mask, int(W / 2)))
+            # Encode the heading as cos(theta) and sin(theta) frames matching image dimensions,
+            # so the mapping between panorama and weather heading can be learned
+            _, H, W = F.get_dimensions(I0)
+            cos = torch.cos(torch.linspace(0, 2 * torch.pi, W).unsqueeze(0).expand(H, -1))
+            sin = torch.sin(torch.linspace(0, 2 * torch.pi, W).unsqueeze(0).expand(H, -1))
+            angle_mask = torch.stack([cos, sin, torch.zeros_like(sin)], dim=0)
+            angle_mask = (angle_mask + 1.0) / 2.0
+            # Assuming North centered images, roll angle mask to have 0 at half-width
+            angle_mask = F.to_image(torch.roll(angle_mask, int(W / 2)))
 
         if self.img_transform is not None:
             assert all(isinstance(I, tv_tensors.Image) for I in (I0, It, It_prev, view_mask, angle_mask))
@@ -451,9 +479,12 @@ def get_photocast_transforms(cfg, crop="center"):
     "random" for a crop at a random heading (same crop for all frames and masks of a sample),
     "panorama" to resize the full 360 deg panorama to exactly img_size, e.g. (256, 2048), so every column
     maps to the same heading for every camera,
+    "native" to keep the camera's native field of view at its own width (the dataset resizes it, see native_size),
     None to keep the full panorama (resized to the crop height, aspect preserved)
     """
 
+    if crop == "native":
+        crop = None  # the dataset resizes to (H, camera width) itself: only the height resize below (a no-op) applies
     if crop == "panorama":
         return v2.Compose([
             v2.Resize(tuple(cfg['data']['img_size']), interpolation=v2.InterpolationMode.BICUBIC, antialias=True),
@@ -473,6 +504,10 @@ def get_photocast_transforms(cfg, crop="center"):
         v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
+def native_size_from_cfg(cfg):
+    """(height, width multiple) of native field of view panoramas"""
+    return (cfg['data']['img_size'][0], cfg['data'].get('width_multiple', 32))
+
 def camera_csv_path(cfg, camera):
     return os.path.join(cfg['data']['image_root_dir'], "images", "2026-09-24_train_cams", f"{camera}.csv")
 
@@ -481,10 +516,15 @@ def get_photocast_dataloader(cfg):
     Training dataset over all cameras in cfg["data"]["train"], with the weather zarr store opened once
     and shared by every camera. Samples are dicts with
     "tensors": (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask).
+    With train_crop "native", every camera has its own width and dataset.widths holds the width of every sample
+    (batch them with util.sampler.WidthBinBatchSampler).
     """
 
-    # "random": img_size crops at a random heading; "panorama": full panoramas resized to img_size
-    transforms = get_photocast_transforms(cfg, crop=cfg["data"].get("train_crop", "random"))
+    # "random": img_size crops at a random heading; "panorama": full panoramas resized to img_size;
+    # "native": native field of view at a per-camera width (multiple of data.width_multiple, the patch size)
+    train_crop = cfg["data"].get("train_crop", "random")
+    transforms = get_photocast_transforms(cfg, crop=train_crop)
+    native_size = native_size_from_cfg(cfg) if train_crop == "native" else None
 
     shared_weather = xr.open_zarr(os.path.join(cfg["data"]["weather_root_dir"], "inca.zarr"), consolidated=True, chunks=None)
 
@@ -502,7 +542,8 @@ def get_photocast_dataloader(cfg):
                                        viewshed_radius=cfg["data"]["viewshed_radius"],
                                        img_transform=transforms,
                                        lead_times=cfg["data"]["lead_times"],
-                                       date_ranges=cfg["data"].get("date_ranges"))
+                                       date_ranges=cfg["data"].get("date_ranges"),
+                                       native_size=native_size)
             )
             cameras.append(camera)
         except IndexError as e:
@@ -511,8 +552,9 @@ def get_photocast_dataloader(cfg):
 
     dataset = torch.utils.data.ConcatDataset(datasets)
     dataset.cameras = cameras
+    dataset.widths = np.concatenate([np.full(len(d), d.width) for d in datasets]) if native_size is not None else None
     print(f"Loaded {len(cameras)}/{len(cfg['data']['train'])} cameras, {len(dataset)} samples")
     for camera, d in zip(cameras, datasets):
-        print(f"  {camera}  {len(d)} samples ({len(d.data)} images)")
+        print(f"  {camera}  {len(d)} samples ({len(d.data)} images)" + (f", width {d.width}" if d.width else ""))
 
     return dataset

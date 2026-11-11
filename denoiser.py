@@ -20,6 +20,7 @@ class Denoiser(nn.Module):
             attn_drop=args.attn_dropout,
             proj_drop=args.proj_dropout,
             circular_rope=getattr(args, 'circular_rope', False),
+            cylindrical=getattr(args, 'cylindrical', False),
         )
         self.img_size = self.net.input_size  # (H, W)
 
@@ -45,6 +46,18 @@ class Denoiser(nn.Module):
         self.steps = args.num_sampling_steps
         # weather CFG: v(weather) + (cfg_scale - 1) * (v(weather) - v(null weather)), frames always kept
         self.cfg_scale = getattr(args, 'cfg', 1.0)
+
+    # channels of cond (see make_conditioning): I0 (3), It_prev (3), angle_mask (cos, sin, 0), view_mask (1)
+    ANGLE_COS, ANGLE_SIN = 6, 7
+
+    def column_angles(self, cond):
+        """
+        (N, W) azimuth of every column in radians (0 = North) for cylindrical models, None otherwise. Read back from
+        the angle_mask channels (cos, sin, normalized to [-1, 1]), so it follows any crop or resize of the frames.
+        """
+        if not self.net.cylindrical:
+            return None
+        return torch.atan2(cond[:, self.ANGLE_SIN].float().mean(1), cond[:, self.ANGLE_COS].float().mean(1))
 
     @staticmethod
     def make_conditioning(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask):
@@ -85,7 +98,7 @@ class Denoiser(nn.Module):
         z = t * x + (1 - t) * e
         v = (x - z) / (1 - t).clamp_min(self.t_eps)
 
-        x_pred = self.net(z, t.flatten(), cond, w, w_drop)
+        x_pred = self.net(z, t.flatten(), cond, w, w_drop, angles=self.column_angles(cond))
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
 
         # l2 loss over the valid field of view only: view_mask is normalized to [-1, 1] with the image
@@ -126,13 +139,15 @@ class Denoiser(nn.Module):
     def _forward_sample(self, z, t, cond, w):
         """Velocity at (z, t), with weather CFG when cfg_scale != 1. t: (N, 1, 1, 1)"""
         if self.cfg_scale == 1.0:
-            x_pred = self.net(z, t.flatten(), cond, w)
+            x_pred = self.net(z, t.flatten(), cond, w, angles=self.column_angles(cond))
             return (x_pred - z) / (1.0 - t).clamp_min(self.t_eps)
 
         # conditional and null-weather predictions in one batch
         n = z.shape[0]
         w_drop = torch.arange(2 * n, device=z.device) >= n
-        x_pred = self.net(torch.cat([z, z]), t.flatten().repeat(2), torch.cat([cond, cond]), torch.cat([w, w]), w_drop)
+        angles = self.column_angles(cond)
+        x_pred = self.net(torch.cat([z, z]), t.flatten().repeat(2), torch.cat([cond, cond]), torch.cat([w, w]), w_drop,
+                          angles=None if angles is None else torch.cat([angles, angles]))
         v_cond, v_uncond = ((x_pred - torch.cat([z, z])) / (1.0 - t.repeat(2, 1, 1, 1)).clamp_min(self.t_eps)).chunk(2)
         return v_uncond + self.cfg_scale * (v_cond - v_uncond)
 

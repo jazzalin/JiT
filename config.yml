@@ -67,11 +67,16 @@ data:
   - 128
   - 1024
   image_root_dir: ./data
-  # full 360 deg panoramas resized to 256 x 2048 (train_crop: random for 256 x 256 crops at a random heading)
+  # train_crop:
+  #   native:   native field of view of every camera at height img_size[0] and its own width (multiple of
+  #             width_multiple, the patch size), batched by width, for cylindrical models
+  #   panorama: full 360 deg panoramas resized to img_size (256 x 2048)
+  #   random:   img_size crops at a random heading
   img_size:
   - 256
   - 2048
-  train_crop: panorama
+  train_crop: native
+  width_multiple: 32
   num_workers: 40
   viewshed_radius: 8000
   train:
