@@ -242,7 +242,10 @@ def main(args):
     cfg['data']['img_size'] = [img_h, img_w]
     tile = img_h
     # cylindrical models: native field of view, one width per camera (multiple of the patch size)
-    native_size = (img_h, model.net.patch_size) if cylindrical else None
+    # same width rounding as training (data.width_multiple, a multiple of the patch size)
+    width_multiple = cfg['data'].get('width_multiple', 32)
+    assert width_multiple % model.net.patch_size == 0, 'data.width_multiple must be a multiple of the patch size'
+    native_size = (img_h, width_multiple) if cylindrical else None
     print('Model trained on {}'.format('native field of view panoramas of height {} (cylindrical)'.format(img_h)
                                        if cylindrical else '{}x{} {}'.format(img_h, img_w, 'panoramas' if panorama_model else 'crops')))
     if panorama_model and 'crop' in args.mode:

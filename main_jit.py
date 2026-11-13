@@ -38,6 +38,21 @@ def get_args_parser():
     # --cylindrical is set automatically for native field of view data (data.train_crop: native)
     parser.add_argument('--cylindrical', action='store_true',
                         help='Panoramas of any width: position embedding and column RoPE from each column azimuth')
+    parser.add_argument('--turn_tokens', type=int, default=None,
+                        help='Cylindrical models: nominal patches per 360 deg for the column RoPE frequencies '
+                             '(default 48 * 32 / patch_size: 48 for 32 px patches, 96 for 16 px patches)')
+    parser.add_argument('--fused_attn', action='store_true',
+                        help="Memory-efficient attention (torch scaled_dot_product_attention / FlashAttention) instead "
+                             "of the explicit fp32 attention matrix; needed for 16 px patches on full panoramas")
+    parser.add_argument('--grad_ckpt', action='store_true',
+                        help='Gradient checkpointing of the transformer blocks (less memory, ~30%% slower)')
+    parser.add_argument('--init_from', default='',
+                        help='Checkpoint (file or run folder) to initialise the weights from when not resuming, e.g. a '
+                             '32 px patch run for a 16 px patch model: weights with matching names and shapes are '
+                             'copied (the transformer blocks), the others (patch embedding, output layer) keep their '
+                             'fresh initialisation')
+    parser.add_argument('--init_key', default='model_ema1', choices=['model', 'model_ema1', 'model_ema2'],
+                        help='Weights of the --init_from checkpoint to copy')
     parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
     parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
 
@@ -136,6 +151,26 @@ def get_args_parser():
     return parser
 
 
+def init_weights(model, path, key='model_ema1'):
+    """
+    Copies the weights of another checkpoint whose names and shapes match (e.g. the transformer blocks of a 32 px
+    patch model into a 16 px patch model); the others keep their fresh initialisation. Prints what was skipped.
+    """
+    if os.path.isdir(path):
+        path = os.path.join(path, 'checkpoint-last.pth')
+    source = torch.load(path, map_location='cpu', weights_only=False)[key]
+    target = model.state_dict()
+    copied = {k: v for k, v in source.items() if k in target and target[k].shape == v.shape}
+    skipped = sorted(k for k in source if k not in copied)
+    missing = sorted(k for k in target if k not in source)
+    model.load_state_dict(copied, strict=False)
+    print("Initialised {} / {} tensors from {} ({})".format(len(copied), len(target), path, key))
+    for k in skipped:
+        print("  not copied (shape {} -> {}): {}".format(tuple(source[k].shape), tuple(target[k].shape) if k in target else None, k))
+    for k in missing:
+        print("  not in the checkpoint (fresh): {}".format(k))
+
+
 def main(args):
     misc.init_distributed_mode(args)
     print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
@@ -229,6 +264,10 @@ def main(args):
     torch._dynamo.config.cache_size_limit = 128
     torch._dynamo.config.optimize_ddp = False
 
+    # Column RoPE frequencies of cylindrical models scale with the patch size (48 nominal patches per turn at 32 px)
+    if args.turn_tokens is None:
+        args.turn_tokens = 48 * 32 // int(args.model.split('/')[-1])
+
     # Create denoiser
     model = Denoiser(args)
 
@@ -272,9 +311,12 @@ def main(args):
             print("Loaded optimizer & scaler state!")
         del checkpoint
     else:
+        if args.init_from:
+            init_weights(model_without_ddp, args.init_from, args.init_key)
         model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
         model_without_ddp.ema_params2 = copy.deepcopy(list(model_without_ddp.parameters()))
-        print("Training from scratch")
+        print("Training from scratch" if not args.init_from else "Training from the {} weights of {}".format(
+            args.init_key, args.init_from))
 
     # Evaluate generation
     if args.evaluate_gen:

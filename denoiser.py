@@ -21,6 +21,10 @@ class Denoiser(nn.Module):
             proj_drop=args.proj_dropout,
             circular_rope=getattr(args, 'circular_rope', False),
             cylindrical=getattr(args, 'cylindrical', False),
+            # older checkpoints: 48 (tuned for 32 px patches), standard attention, no gradient checkpointing
+            turn_tokens=getattr(args, 'turn_tokens', None) or 48,
+            fused_attn=getattr(args, 'fused_attn', False),
+            grad_ckpt=getattr(args, 'grad_ckpt', False),
         )
         self.img_size = self.net.input_size  # (H, W)
 

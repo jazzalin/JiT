@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm, rotate_half, \
     CylindricalPosEmbed, patch_azimuths, cylindrical_rope
 
@@ -101,9 +102,12 @@ def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tens
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0., fused=False):
         super().__init__()
         self.num_heads = num_heads
+        # fused: torch's memory-efficient scaled_dot_product_attention (FlashAttention on recent GPUs) in the autocast
+        # dtype, O(N) memory instead of the full N x N fp32 attention matrix; needed for long token sequences
+        self.fused = fused
         head_dim = dim // num_heads
 
         self.q_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
@@ -130,7 +134,12 @@ class Attention(nn.Module):
             q = rope(q)
             k = rope(k)
 
-        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+        dropout_p = self.attn_drop.p if self.training else 0.
+        if self.fused:
+            q, k = q.to(v.dtype), k.to(v.dtype)
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        else:
+            x = scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         x = x.transpose(1, 2).reshape(B, N, C)
 
@@ -182,11 +191,11 @@ class FinalLayer(nn.Module):
 
 
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, fused_attn=False):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
-                              attn_drop=attn_drop, proj_drop=proj_drop)
+                              attn_drop=attn_drop, proj_drop=proj_drop, fused=fused_attn)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
@@ -227,9 +236,13 @@ class JiT(nn.Module):
         in_context_start=8,
         circular_rope=False,
         cylindrical=False,
-        turn_tokens=48
+        turn_tokens=48,
+        fused_attn=False,
+        grad_ckpt=False
     ):
         super().__init__()
+        # recompute each block's activations in the backward pass instead of storing them (saves memory, ~30% slower)
+        self.grad_ckpt = grad_ckpt
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.patch_size = patch_size
@@ -293,7 +306,8 @@ class JiT(nn.Module):
         self.blocks = nn.ModuleList([
             JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                      attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
-                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0)
+                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
+                     fused_attn=fused_attn)
             for i in range(depth)
         ])
 
@@ -396,7 +410,11 @@ class JiT(nn.Module):
             # in-context
             if self.in_context_len > 0 and i == self.in_context_start:
                 x = torch.cat([w_tokens, x], dim=1)
-            x = block(x, c, rope if i < self.in_context_start else rope_incontext)
+            r = rope if i < self.in_context_start else rope_incontext
+            if self.grad_ckpt and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, c, r, use_reentrant=False)
+            else:
+                x = block(x, c, r)
 
         x = x[:, self.in_context_len:]
 
