@@ -77,6 +77,15 @@ data:
   - 2048
   train_crop: native
   width_multiple: 32
+  # clear-sky reference frame (an extra conditioning image), from the clear_score_index.py outputs in dir:
+  # the latest frame before I0 whose clear_score is in the camera's top (1 - quantile) of daytime frames, taken at
+  # most max_age_days before I0 and within tod_window_min of the target's time of day; black when none qualifies
+  reference:
+    enabled: true
+    dir: ./data/images/references
+    max_age_days: 14
+    tod_window_min: 60
+    quantile: 0.9
   num_workers: 40
   viewshed_radius: 8000
   train:

@@ -1,5 +1,6 @@
 import math
 import sys
+import time
 import os
 import shutil
 import json
@@ -43,11 +44,15 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
     optimizer.zero_grad()
 
     if log_writer is not None:
-        print('log_dir: {}'.format(log_writer.log_dir))
+        print('W&B run dir: {}'.format(log_writer.log_dir))
 
+    # time per step and time spent waiting for the data loader (main process), for the W&B epoch summary
+    epoch_start = step_end = time.time()
+    data_wait = 0.0
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        # (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
-        tensors = [t.to(device, non_blocking=True) for t in batch["tensors"]]
+        data_wait += time.time() - step_end
+        # (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask[, Iref, ref_age])
+        tensors = [t.to(device, non_blocking=True) for t in (*batch["tensors"], *batch.get("reference", ()))]
         # per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
@@ -73,15 +78,21 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
 
-        if log_writer is not None:
-            # Use epoch_1000x as the x-axis in TensorBoard to calibrate curves.
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
-            if data_iter_step % args.log_freq == 0:
-                log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-                log_writer.add_scalar('lr', lr, epoch_1000x)
-                host_mem = host_memory_gb()
-                log_writer.add_scalar('host_mem_gb', host_mem, epoch_1000x)
-                metric_logger.update(host_mem_gb=host_mem)
+        step_end = time.time()
+
+        if log_writer is not None and data_iter_step % args.log_freq == 0:
+            # x-axis: fractional epoch
+            host_mem = host_memory_gb()
+            metric_logger.update(host_mem_gb=host_mem)
+            log_writer.log({'train/loss': loss_value_reduce, 'train/lr': lr, 'train/host_mem_gb': host_mem},
+                           epoch + data_iter_step / len(data_loader))
+
+    if log_writer is not None:
+        # epoch averages (main process), plotted at the end of the epoch
+        steps = max(len(data_loader), 1)
+        log_writer.log({'train/loss_epoch': metric_logger.meters['loss'].global_avg,
+                        'train/sec_per_step': (time.time() - epoch_start) / steps,
+                        'train/data_wait_fraction': data_wait / max(time.time() - epoch_start, 1e-9)}, epoch + 1)
 
 
 def load_preview_sample(dataset, index, seed):
@@ -127,8 +138,9 @@ def evaluate(model_without_ddp, dataset, args, epoch, batch_size=64, log_writer=
     preview_idx = np.hstack([preview_idx, np.zeros(world_size * batch_size * num_steps, dtype=int)])
     if misc.is_main_process():
         with open(save_folder + "-preview.json", "w") as f:
-            json.dump([{"view": dataset[int(k)]["view"], "datetimes": dataset[int(k)]["datetimes"]}
-                       for k in preview_idx[:min(args.grid_size, args.num_images)]], f, indent=2)
+            previews = [dataset[int(k)] for k in preview_idx[:min(args.grid_size, args.num_images)]]
+            json.dump([{"view": p["view"], "datetimes": p["datetimes"], "reference": p.get("reference_time")}
+                       for p in previews], f, indent=2)
 
     grid_images = []
     for i in range(num_steps):
@@ -146,11 +158,12 @@ def evaluate(model_without_ddp, dataset, args, epoch, batch_size=64, log_writer=
         for g, members in enumerate(groups.values()):
             batch = default_collate([samples[j] for j in members])
             I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask = [t.cuda() for t in batch["tensors"]]
+            reference = [t.cuda() for t in batch.get("reference", ())]  # (Iref, ref_age) for reference models
             # fixed noise per batch so samples are comparable across epochs; fork_rng leaves the training RNG untouched
             with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
                 torch.manual_seed(args.seed + world_size * i + local_rank + 1000003 * g)
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    x = model_without_ddp.generate(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
+                    x = model_without_ddp.generate(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask, *reference)
             # denormalize images
             x = ((x.float() + 1) / 2).detach().cpu()
             for j, img in zip(members, x):
@@ -163,10 +176,14 @@ def evaluate(model_without_ddp, dataset, args, epoch, batch_size=64, log_writer=
             img_id = i * batch_size * world_size + local_rank * batch_size + b_id
             if img_id >= args.num_images:
                 break
-            if len(grid_images) < 4 * args.grid_size:
-                # one grid row per sample: It_prev | I0 | It (ground truth) | It (forecast)
+            if b_id + i * batch_size * world_size < args.grid_size:
+                # one grid row per sample: [Iref |] It_prev | I0 | It (ground truth) | It (forecast)
                 I0, It, It_prev = samples[b_id]["tensors"][:3]
-                for frame in (It_prev, I0, It):
+                frames = (It_prev, I0, It)
+                if "reference" in samples[b_id]:
+                    frames = (samples[b_id]["reference"][0],) + frames
+                nrow = len(frames) + 1
+                for frame in frames:
                     grid_images.append(((frame.float() + 1) / 2).clamp(0, 1))
                 grid_images.append(sampled_images[b_id].clamp(0, 1))
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
@@ -186,10 +203,12 @@ def evaluate(model_without_ddp, dataset, args, epoch, batch_size=64, log_writer=
         panorama = any(g.shape[-1] > g.shape[-2] for g in grid_images)
         max_w = max(g.shape[-1] for g in grid_images)
         grid_images = [torch.nn.functional.pad(g, (0, max_w - g.shape[-1]), value=1.0) for g in grid_images]
-        grid = torchvision.utils.make_grid(grid_images, nrow=1 if panorama else 4, padding=2)
+        grid = torchvision.utils.make_grid(grid_images, nrow=1 if panorama else nrow, padding=2)
         torchvision.utils.save_image(grid, save_folder + "-grid.png")
         if log_writer is not None:
-            log_writer.add_image('samples', grid, epoch)
+            # plotted at the end of the epoch whose weights generated it
+            log_writer.add_image('samples', grid, epoch + 1,
+                                 caption='rows per sample: ' + ('Iref, ' if nrow == 5 else '') + 'It_prev, I0, It (truth), forecast')
 
     # compute FID and IS
     if log_writer is not None and not args.skip_fid:
@@ -213,8 +232,7 @@ def evaluate(model_without_ddp, dataset, args, epoch, batch_size=64, log_writer=
         fid = metrics_dict['frechet_inception_distance']
         inception_score = metrics_dict['inception_score_mean']
         postfix = "_cfg{}_res{}".format(model_without_ddp.cfg_scale, args.img_size)
-        log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
-        log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
+        log_writer.log({'eval/fid{}'.format(postfix): fid, 'eval/is{}'.format(postfix): inception_score}, epoch + 1)
         print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
         shutil.rmtree(save_folder)
 

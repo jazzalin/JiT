@@ -88,6 +88,9 @@ def get_args_parser():
                         help='Probability of blacking out I0 and It_prev together during training')
     parser.add_argument('--weather_drop_prob', default=0.1, type=float,
                         help='Probability of replacing the weather by the learned null weather during training (weather CFG)')
+    parser.add_argument('--ref_drop_prob', default=0.2, type=float,
+                        help='Reference models (data.reference in the config): probability of replacing the clear-sky '
+                             'reference by the missing reference (black, age -1) during training')
 
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -136,7 +139,17 @@ def get_args_parser():
                         help='Folder that contains checkpoint to resume from')
     parser.add_argument('--save_last_freq', type=int, default=5,
                         help='Frequency (in epochs) to save checkpoints')
-    parser.add_argument('--log_freq', default=100, type=int)
+    parser.add_argument('--log_freq', default=100, type=int,
+                        help='Steps between W&B logs of the training loss, learning rate and host memory')
+
+    # Weights & Biases logging (main process only)
+    parser.add_argument('--no_wandb', action='store_true', help='Disable W&B logging')
+    parser.add_argument('--wandb_project', default='photocast-jit', type=str)
+    parser.add_argument('--wandb_entity', default=None, type=str, help='W&B team or user (default: your default entity)')
+    parser.add_argument('--wandb_name', default=None, type=str, help='Run name (default: the output folder name)')
+    parser.add_argument('--wandb_mode', default='online', choices=['online', 'offline'],
+                        help='offline: log to <output_dir>/wandb only (e.g. compute nodes without internet), '
+                             'upload later with `wandb sync`')
     parser.add_argument('--device', default='cuda',
                         help='Device to use for training/testing')
 
@@ -155,16 +168,29 @@ def init_weights(model, path, key='model_ema1'):
     """
     Copies the weights of another checkpoint whose names and shapes match (e.g. the transformer blocks of a 32 px
     patch model into a 16 px patch model); the others keep their fresh initialisation. Prints what was skipped.
+    The input patch embedding of a model with more conditioning channels (e.g. the reference frame) is copied for
+    the old channels and zeroed for the new ones, so the model starts out ignoring them and behaves like the source.
     """
     if os.path.isdir(path):
         path = os.path.join(path, 'checkpoint-last.pth')
     source = torch.load(path, map_location='cpu', weights_only=False)[key]
     target = model.state_dict()
     copied = {k: v for k, v in source.items() if k in target and target[k].shape == v.shape}
+    extended = []
+    k = 'net.x_embedder.proj1.weight'  # (pca_dim, in_channels + cond_channels, p, p), new channels appended
+    if k in source and k in target and k not in copied:
+        s, t = source[k], target[k]
+        if s.shape[0] == t.shape[0] and s.shape[2:] == t.shape[2:] and s.shape[1] < t.shape[1]:
+            w = torch.zeros_like(t)
+            w[:, :s.shape[1]] = s
+            copied[k] = w
+            extended.append((k, s.shape[1], t.shape[1]))
     skipped = sorted(k for k in source if k not in copied)
     missing = sorted(k for k in target if k not in source)
     model.load_state_dict(copied, strict=False)
     print("Initialised {} / {} tensors from {} ({})".format(len(copied), len(target), path, key))
+    for k, old, new in extended:
+        print("  extended {}: {} -> {} input channels (new channels zero)".format(k, old, new))
     for k in skipped:
         print("  not copied (shape {} -> {}): {}".format(tuple(source[k].shape), tuple(target[k].shape) if k in target else None, k))
     for k in missing:
@@ -191,15 +217,14 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
-    # TensorBoard logging disabled
     if global_rank == 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
-    log_writer = None
 
     dataset_train = get_photocast_dataloader(config)
 
     # conditioning sizes from one sample: (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
-    I0, _, It_prev, w0, wt, wt_prev, angle_mask, view_mask = dataset_train[0]["tensors"]
+    sample = dataset_train[0]
+    I0, _, It_prev, w0, wt, wt_prev, angle_mask, view_mask = sample["tensors"]
     data_size = list(I0.shape[1:])
     native = getattr(dataset_train, "widths", None) is not None
     if native:
@@ -220,6 +245,12 @@ def main(args):
     print("Image size: {}x{}".format(*img_size))
     args.img_size = img_size[0] if img_size[0] == img_size[1] else img_size
     args.cond_channels = I0.shape[0] + It_prev.shape[0] + angle_mask.shape[0] + view_mask.shape[0]
+    # clear-sky reference frame (data.reference in the config): Iref (3) and its age (1) as extra channels
+    args.use_reference = "reference" in sample
+    if args.use_reference:
+        args.cond_channels += Denoiser.REF_CHANNELS
+        print("Reference frame conditioning: {} extra channels, dropped with probability {}".format(
+            Denoiser.REF_CHANNELS, args.ref_drop_prob))
     args.weather_channels = w0.shape[0]  # per time step, the embedder is shared across (wt, w0, wt_prev)
     args.weather_times = 3
     assert w0.shape[1] == w0.shape[2], "weather crops must be square, got {}".format(tuple(w0.shape[1:]))
@@ -318,6 +349,14 @@ def main(args):
         print("Training from scratch" if not args.init_from else "Training from the {} weights of {}".format(
             args.init_key, args.init_from))
 
+    # W&B logging from the main process, created once the arguments are complete (logged as the run config);
+    # a resumed run (checkpoint in --resume) continues the same W&B run
+    log_writer = None
+    if global_rank == 0 and not args.no_wandb:
+        from util.wandb_logger import WandbLogger
+        log_writer = WandbLogger(args, project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_name,
+                                 mode=args.wandb_mode, resume=args.start_epoch > 0)
+
     # Evaluate generation
     if args.evaluate_gen:
         print("Evaluating checkpoint at {} epoch".format(args.start_epoch))
@@ -325,6 +364,8 @@ def main(args):
             torch.manual_seed(seed)
             with torch.no_grad():
                 evaluate(model_without_ddp, dataset_train, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+        if log_writer is not None:
+            log_writer.finish()
         return
 
     # Training loop
@@ -367,6 +408,8 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time:', total_time_str)
+    if log_writer is not None:
+        log_writer.finish()
 
 
 if __name__ == '__main__':

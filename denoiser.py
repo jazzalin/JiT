@@ -38,6 +38,9 @@ class Denoiser(nn.Module):
         self.cond_drop_prob = getattr(args, 'cond_drop_prob', 0.0)
         self.cond_drop_both_prob = getattr(args, 'cond_drop_both_prob', 0.0)
         self.weather_drop_prob = getattr(args, 'weather_drop_prob', 0.0)
+        # clear-sky reference frame (Iref, ref_age) as 4 extra conditioning channels, dropped with ref_drop_prob
+        self.use_reference = getattr(args, 'use_reference', False)
+        self.ref_drop_prob = getattr(args, 'ref_drop_prob', 0.0)
 
         # ema
         self.ema_decay1 = args.ema_decay1
@@ -52,7 +55,9 @@ class Denoiser(nn.Module):
         self.cfg_scale = getattr(args, 'cfg', 1.0)
 
     # channels of cond (see make_conditioning): I0 (3), It_prev (3), angle_mask (cos, sin, 0), view_mask (1)
+    # [, Iref (3), ref_age (1)]
     ANGLE_COS, ANGLE_SIN = 6, 7
+    REF_CHANNELS = 4
 
     def column_angles(self, cond):
         """
@@ -63,15 +68,30 @@ class Denoiser(nn.Module):
             return None
         return torch.atan2(cond[:, self.ANGLE_SIN].float().mean(1), cond[:, self.ANGLE_COS].float().mean(1))
 
-    @staticmethod
-    def make_conditioning(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask):
+    def make_conditioning(self, I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask, Iref=None, ref_age=None):
         """
         Channel-concatenates the conditioning frames, and stacks the weather fields along a time axis
-        in the same order as the frames ([It,] I0, It_prev): (N, 3, C_w, H_w, W_w)
+        in the same order as the frames ([It,] I0, It_prev): (N, 3, C_w, H_w, W_w).
+        Reference models also get the clear-sky reference frame Iref and a constant plane with its age ref_age
+        (N, 1) (see photocast_dataloader.reference_age_value); without Iref, the reference is black with age -1.
         """
-        cond = torch.cat([I0, It_prev, angle_mask, view_mask], dim=1)
+        frames = [I0, It_prev, angle_mask, view_mask]
+        if self.use_reference:
+            if Iref is None:
+                Iref = torch.full_like(I0, -1.0)
+                ref_age = torch.full((I0.shape[0], 1), -1.0, device=I0.device)
+            age = ref_age.to(I0.dtype).view(-1, 1, 1, 1).expand(-1, 1, *I0.shape[-2:])
+            frames += [Iref, age]
+        cond = torch.cat(frames, dim=1)
         w = torch.stack([wt, w0, wt_prev], dim=1)
         return cond, w
+
+    def drop_reference(self, Iref, ref_age):
+        """Replaces the reference by the missing reference (black, age -1) with probability ref_drop_prob"""
+        dropped = torch.rand(Iref.shape[0], device=Iref.device) < self.ref_drop_prob
+        Iref = torch.where(dropped.view(-1, 1, 1, 1), torch.full_like(Iref, -1.0), Iref)
+        ref_age = torch.where(dropped.view(-1, 1), torch.full_like(ref_age, -1.0), ref_age)
+        return Iref, ref_age
 
     def drop_frames(self, I0, It_prev):
         """
@@ -88,13 +108,15 @@ class Denoiser(nn.Module):
         z = torch.randn(n, device=device) * self.P_std + self.P_mean
         return torch.sigmoid(z)
 
-    def forward(self, I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask):
+    def forward(self, I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask, Iref=None, ref_age=None):
         x = It
         w_drop = None
         if self.training:
             I0, It_prev = self.drop_frames(I0, It_prev)
             w_drop = torch.rand(x.shape[0], device=x.device) < self.weather_drop_prob
-        cond, w = self.make_conditioning(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
+            if self.use_reference and Iref is not None:
+                Iref, ref_age = self.drop_reference(Iref, ref_age)
+        cond, w = self.make_conditioning(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask, Iref, ref_age)
 
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
         e = torch.randn_like(x) * self.noise_scale
@@ -115,9 +137,9 @@ class Denoiser(nn.Module):
         return loss
 
     @torch.no_grad()
-    def generate(self, I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask):
-        """Samples It given the conditioning frames and weather"""
-        cond, w = self.make_conditioning(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
+    def generate(self, I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask, Iref=None, ref_age=None):
+        """Samples It given the conditioning frames and weather (and the reference frame for reference models)"""
+        cond, w = self.make_conditioning(I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask, Iref, ref_age)
         device = I0.device
         bsz = I0.size(0)
         z = self.noise_scale * torch.randn(bsz, 3, *I0.shape[-2:], device=device)

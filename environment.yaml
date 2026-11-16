@@ -13,7 +13,7 @@ dependencies:
       - numpy==1.22.4
       - opencv-python-headless==4.11.0.86
       - timm==0.9.12
-      - tensorboard==2.10.0
+      - wandb
       - scipy==1.9.1
       - einops==0.8.1
       - gdown==5.2.0

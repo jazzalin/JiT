@@ -36,7 +36,7 @@ import yaml
 from PIL import Image, ImageDraw
 
 from denoiser import Denoiser
-from photocast_dataloader import Photocast2DDatasetZarr, get_photocast_transforms, camera_csv_path
+from photocast_dataloader import Photocast2DDatasetZarr, get_photocast_transforms, camera_csv_path, reference_from_cfg
 
 
 def get_args_parser():
@@ -64,6 +64,8 @@ def get_args_parser():
     parser.add_argument('--cfg', nargs='+', default=[1.0], type=float,
                         help='Weather CFG scales (1.0 = no guidance); needs a checkpoint trained with --weather_drop_prob > 0')
     parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--no_reference', action='store_true',
+                        help='Reference models: forecast without the clear-sky reference (black, age -1)')
 
     # sampler
     parser.add_argument('--sampling_method', default='heun', type=str)
@@ -248,6 +250,11 @@ def main(args):
     native_size = (img_h, width_multiple) if cylindrical else None
     print('Model trained on {}'.format('native field of view panoramas of height {} (cylindrical)'.format(img_h)
                                        if cylindrical else '{}x{} {}'.format(img_h, img_w, 'panoramas' if panorama_model else 'crops')))
+    # reference models: clear-sky reference frames selected as in training (data.reference in the config)
+    reference = reference_from_cfg(cfg) if model.use_reference else None
+    if model.use_reference:
+        assert reference is not None, 'the model takes a reference frame: enable data.reference in {}'.format(args.config)
+        print('Reference frames from {}{}'.format(reference['dir'], ' (not used: --no_reference)' if args.no_reference else ''))
     if panorama_model and 'crop' in args.mode:
         print('WARNING: skipping crop mode, the model was trained on full panoramas')
         args.mode = [m for m in args.mode if m != 'crop']
@@ -289,13 +296,18 @@ def main(args):
                                                  img_transform=transform,
                                                  lead_times=cfg['data']['lead_times'],
                                                  date_ranges=cfg['data'].get('date_ranges'),
-                                                 native_size=native_size)
+                                                 native_size=native_size,
+                                                 reference=reference)
             except (FileNotFoundError, IndexError) as e:
                 print('  skipping {}: {}'.format(camera, e))
                 continue
             rng = np.random.default_rng(args.seed)
             idx = rng.choice(len(dataset), size=min(args.num_samples, len(dataset)), replace=False)
             samples = [load_sample(dataset, int(i), args.seed) for i in idx]
+            if reference is not None:
+                # the reference travels with the frames (width matching, stacking): (..., view_mask, Iref, ref_age)
+                for smp in samples:
+                    smp['tensors'] = tuple(smp['tensors']) + tuple(smp['reference'])
             if mode == 'panorama':
                 samples = match_panorama_widths(samples, camera)
             tensors = [torch.stack([s['tensors'][k] for s in samples]).to(device) for k in range(len(samples[0]['tensors']))]
@@ -303,7 +315,8 @@ def main(args):
 
         os.makedirs(mode_dir, exist_ok=True)
         with open(os.path.join(mode_dir, 'samples.json'), 'w') as f:
-            json.dump({c: [s['datetimes'] for s in samples] for c, (samples, _) in data.items()}, f, indent=2)
+            json.dump({c: [s['datetimes'] + ([s['reference_time']] if 'reference_time' in s else []) for s in samples]
+                       for c, (samples, _) in data.items()}, f, indent=2)
 
         # forecasts: (camera, ema, cfg) -> [num_samples, num_seeds, 3, H, W] in [0, 1]
         forecasts = {}
@@ -311,18 +324,20 @@ def main(args):
             model.load_state_dict(checkpoint[weight_keys[ema]])
             model.cfg_scale = cfg_scale
             for camera, (samples, tensors) in data.items():
-                I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask = tensors
+                I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask = tensors[:8]
+                ref = tuple(tensors[8:10]) if reference is not None and not args.no_reference else ()
                 print('{} ema {} cfg {} camera {} ({}x{})'.format(mode, ema, cfg_scale, camera, I0.shape[-2], I0.shape[-1]))
                 # every sample repeated num_seeds times; same seed -> same noise for every setting
-                cond = [x.repeat_interleave(args.num_seeds, dim=0) for x in (I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask)]
+                cond = [x.repeat_interleave(args.num_seeds, dim=0) for x in (I0, It_prev, w0, wt, wt_prev, angle_mask, view_mask) + ref]
                 torch.manual_seed(args.seed)
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     if mode == 'crop' or panorama_model or cylindrical:
                         x = model.generate(*cond)
                     else:
+                        assert not model.use_reference, 'tiled sampling does not support reference models'
                         x = generate_tiled(model, *cond, tile=tile, stride=args.tile_stride, tile_batch=args.tile_batch)
                 # the model gets no training signal outside the field of view: show it black like the real frames
-                x = torch.where(cond[-1] > 0, x.float(), -1.0)
+                x = torch.where(cond[6] > 0, x.float(), -1.0)
                 x = to_unit(x).cpu().unflatten(0, (len(samples), args.num_seeds))
                 forecasts[(camera, ema, cfg_scale)] = x
 
@@ -340,20 +355,25 @@ def main(args):
         forecast_labels = ['ema{} cfg{} #{}'.format(e, c, k) for e, c, k in forecast_keys]
         for camera, (samples, tensors) in data.items():
             I0, It, It_prev = (to_unit(t).cpu() for t in tensors[:3])
+            Iref = to_unit(tensors[8]).cpu() if reference is not None else None
             title = '{}  camera {}  ({})'.format(mode, camera, ckpt_name)
             if mode == 'crop':
                 # one row per sample: It_prev | I0 | It | forecasts
                 rows = []
                 for s, sample in enumerate(samples):
                     dt_prev, dt0, dtt = sample['datetimes']
+                    refs = [Iref[s]] if Iref is not None else []
                     rows.append(('I0 {}\nIt {}'.format(dt0, dtt),
-                                 [It_prev[s], I0[s], It[s]] + [forecasts[(camera, e, c)][s, k] for e, c, k in forecast_keys]))
-                grid = annotated_grid(rows, title=title, col_labels=['It_prev (-24h)', 'I0', 'It (truth)'] + forecast_labels)
+                                 refs + [It_prev[s], I0[s], It[s]] + [forecasts[(camera, e, c)][s, k] for e, c, k in forecast_keys]))
+                grid = annotated_grid(rows, title=title, col_labels=(['Iref'] if Iref is not None else [])
+                                      + ['It_prev (-24h)', 'I0', 'It (truth)'] + forecast_labels)
             else:
                 # panoramas are wide: one row per image, blocks of rows per sample separated by a blank row
                 rows = []
                 for s, sample in enumerate(samples):
                     dt_prev, dt0, dtt = sample['datetimes']
+                    if Iref is not None:
+                        rows.append(('Iref {}'.format(sample.get('reference_time') or 'none'), [Iref[s]]))
                     rows += [('It_prev {}'.format(dt_prev), [It_prev[s]]),
                              ('I0 {}'.format(dt0), [I0[s]]),
                              ('It {} (truth)'.format(dtt), [It[s]])]

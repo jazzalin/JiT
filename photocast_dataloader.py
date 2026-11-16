@@ -71,6 +71,67 @@ def generate_training_three_tuples(dataset, lead_times=[0, 360], lead_time_inter
         
     return idx_tuple[sort_idx], dst
 
+REF_AGE_SCALE_DAYS = 30.0  # the reference age channel holds age / 30 days (0 = taken just before I0), -1 = no reference
+
+
+def reference_age_value(age_days):
+    """Value of the reference age channel: age / REF_AGE_SCALE_DAYS, or -1 without a reference (age_days < 0 or NaN)"""
+    age = np.asarray(age_days, dtype=np.float32)
+    return np.where(np.isfinite(age) & (age >= 0), age / REF_AGE_SCALE_DAYS, -1.0).astype(np.float32)
+
+
+def select_references(index, I0_times, target_times, max_age_days=14, tod_window_min=60, quantile=0.9,
+                      min_sun_elev=5.0):
+    """
+    Clear-sky reference frame of every sample, from a camera's hourly clear-score index (clear_score_index.py):
+    the latest clear frame strictly before I0, at most max_age_days before I0, whose time of day is within
+    tod_window_min minutes of the target's time of day (so it has roughly the target's light).
+    A frame is clear when its clear_score is in the camera's top (1 - quantile) of daytime frames
+    (sun_elev > min_sun_elev): a per-camera rank, so that hazy cameras also get references.
+
+    Args:
+        index: DataFrame of the camera index (columns time, path, valid, sun_elev, clear_score)
+        I0_times, target_times: datetime64 arrays, one entry per sample
+    Returns:
+        ref (int array, -1 when no frame qualifies) into the returned candidate paths, age in days (NaN when none),
+        candidate paths (bytes array), candidate times (datetime64 array)
+    """
+    day = index['valid'].astype(bool) & (index['sun_elev'] > min_sun_elev)
+    score = index['clear_score'].where(day)
+    threshold = np.nanquantile(score, quantile) if day.any() else np.inf
+    cand = index[day & (score >= threshold) & (score > 0)]
+    c_time = pd.to_datetime(cand['time']).to_numpy().astype('datetime64[ns]')
+    c_hour = pd.DatetimeIndex(c_time).hour.to_numpy()
+    c_paths = cand['path'].to_numpy(dtype=str).astype(np.bytes_)
+
+    t0 = np.asarray(I0_times).astype('datetime64[ns]')
+    tt = pd.DatetimeIndex(np.asarray(target_times).astype('datetime64[ns]'))
+    tod = (tt.hour * 60 + tt.minute).to_numpy()
+    earliest = t0 - np.timedelta64(int(max_age_days * 24 * 60), 'm')
+
+    best = np.full(len(t0), -1, dtype=np.int64)
+    best_time = np.full(len(t0), np.datetime64('NaT'), dtype='datetime64[ns]')
+    # the index is hourly: for every hour of day, the latest candidate of that hour before each I0
+    for h in range(24):
+        sel = np.flatnonzero(c_hour == h)
+        if len(sel) == 0:
+            continue
+        diff = np.abs(tod - h * 60)
+        allowed = np.minimum(diff, 24 * 60 - diff) <= tod_window_min
+        order = sel[np.argsort(c_time[sel])]
+        times_h = c_time[order]
+        k = np.searchsorted(times_h, t0, side='left') - 1  # strictly before I0
+        ok = allowed & (k >= 0)
+        k = np.clip(k, 0, None)
+        ok &= times_h[k] >= earliest
+        newer = ok & (np.isnat(best_time) | (times_h[k] > best_time))
+        best[newer] = order[k[newer]]
+        best_time[newer] = times_h[k[newer]]
+
+    age = np.where(best >= 0, (t0 - best_time) / np.timedelta64(1, 'D'), np.nan).astype(np.float32)
+    return best, age, c_paths, c_time
+
+
 class PanoramaNorthRoll(v2.Transform):
     """Roll 360 deg panorama to North heading"""
 
@@ -265,7 +326,8 @@ class Photocast2DDatasetZarr(Dataset):
                  lead_times=[0, 360],
                  reference_times=[(-1, "D")],
                  date_ranges=None,
-                 native_size=None):
+                 native_size=None,
+                 reference=None):
         """
         Args:
             csv_file: Contains information on the timesteps available for training
@@ -282,6 +344,10 @@ class Photocast2DDatasetZarr(Dataset):
                 the padding); (H, multiple) to keep the camera's native field of view instead, resized to height H
                 and a fixed width per camera (self.width, from its first image, rounded to a multiple of `multiple`
                 such as the patch size). The angle_mask then holds the azimuth of every column (0 = North).
+            reference: None for no reference frame, or a dict with the clear-sky reference settings
+                (see select_references): dir (folder of the clear_score_index.py outputs), max_age_days,
+                tod_window_min, quantile. Samples then also hold "reference": (Iref, ref_age), with Iref black and
+                ref_age -1 when no clear frame qualifies (ref_age: age / REF_AGE_SCALE_DAYS, a [1] tensor)
         """
         self.data = pd.read_csv(csv_file, index_col=0)
         self.data.index = pd.to_datetime(self.data["reference"])
@@ -344,6 +410,26 @@ class Photocast2DDatasetZarr(Dataset):
         self.paths = self.data["path"].to_numpy(dtype=str).astype(np.bytes_)  # fixed-width bytes, 1 byte per character
         self.times = self.data.index.to_numpy()
         self.cam = str(self.data["cam"].iloc[0])
+
+        # Clear-sky reference frame of every sample (index into self.ref_paths, -1 for none)
+        self.reference = reference
+        if reference is not None:
+            camera = os.path.splitext(os.path.basename(csv_file))[0]
+            index_csv = os.path.join(reference["dir"], f"{camera}.csv")
+            if os.path.exists(index_csv):
+                index = pd.read_csv(index_csv, usecols=["time", "path", "valid", "sun_elev", "clear_score"])
+            else:
+                print(f"WARNING: no clear-score index for {camera} ({index_csv}): no reference frames")
+                index = pd.DataFrame({"time": pd.Series(dtype=str), "path": pd.Series(dtype=str),
+                                      "valid": pd.Series(dtype=bool), "sun_elev": pd.Series(dtype=float),
+                                      "clear_score": pd.Series(dtype=float)})
+            ref, age, self.ref_paths, self.ref_times = select_references(
+                index, self.times[self.pairs[:, 1]], self.times[self.pairs[:, 2]],
+                max_age_days=reference.get("max_age_days", 14), tod_window_min=reference.get("tod_window_min", 60),
+                quantile=reference.get("quantile", 0.9))
+            self.ref_idx = ref.astype(np.int32)
+            self.ref_age = reference_age_value(age)
+            self.ref_fraction = float((ref >= 0).mean()) if len(ref) else 0.0
 
     def __len__(self):
         return len(self.pairs)
@@ -418,6 +504,24 @@ class Photocast2DDatasetZarr(Dataset):
         I0 = F.to_image(Img.open(os.path.join(self.image_root_dir, self.paths[I0_idx].decode())))
         It = F.to_image(Img.open(os.path.join(self.image_root_dir, self.paths[It_idx].decode())))
 
+        # Clear-sky reference frame, black (-1 after normalization) when none qualifies
+        Iref, ref_time = None, ""
+        if self.reference is not None:
+            r = int(self.ref_idx[index])
+            if r >= 0:
+                try:
+                    Iref = F.to_image(Img.open(os.path.join(self.image_root_dir, self.ref_paths[r].decode())).convert("RGB"))
+                    ref_time = pd.Timestamp(self.ref_times[r]).strftime('%Y-%m-%d_%H:%M')
+                except OSError:
+                    Iref = None
+            ref_age = torch.tensor([self.ref_age[index] if Iref is not None else -1.0], dtype=torch.float32)
+            if Iref is None:
+                Iref = tv_tensors.Image(torch.zeros_like(I0))
+            elif Iref.shape[-2:] != I0.shape[-2:]:
+                # the camera resolution can change over time
+                Iref = F.resize(Iref, list(I0.shape[-2:]), interpolation=v2.InterpolationMode.BICUBIC, antialias=True)
+        frames = (I0, It, It_prev) if Iref is None else (I0, It, It_prev, Iref)
+
         # Crop corresponding 2D weather maps
         times = [pd.Timestamp(self.times[i]) for i in (It_prev_idx, I0_idx, It_idx)]
         wt_prev = self.get_weather_crop(times[0])
@@ -427,8 +531,8 @@ class Photocast2DDatasetZarr(Dataset):
         if self.native_size is not None:
             # Native field of view, resized to the camera's fixed size: no padding, so the view mask is all ones
             H, W = self.native_size[0], self.width
-            I0, It, It_prev = (F.resize(I, [H, W], interpolation=v2.InterpolationMode.BICUBIC, antialias=True)
-                               for I in (I0, It, It_prev))
+            frames = tuple(F.resize(I, [H, W], interpolation=v2.InterpolationMode.BICUBIC, antialias=True)
+                           for I in frames)
             view_mask = F.to_image(torch.ones((1, H, W)))
             # azimuth of every column: the image spans `angle` degrees, North at column north * W
             azimuth = (torch.arange(W) - self.north * W) * (self.angle / 360.0) * (2 * torch.pi / W)
@@ -439,14 +543,15 @@ class Photocast2DDatasetZarr(Dataset):
             # Expand panorama to 360 FOV, keeping track of the expanded region with a mask image
             _, H, W = F.get_dimensions(I0)
             view_mask = F.to_image(torch.ones((1, H, W)))
-            I0, It, It_prev, view_mask = self.tf_expand(I0, It, It_prev, view_mask)
+            *frames, view_mask = self.tf_expand(*frames, view_mask)
 
             # Roll panorama to have North in center
-            I0, It, It_prev, view_mask = self.tf_roll(I0, It, It_prev, view_mask)
+            *frames, view_mask = self.tf_roll(*frames, view_mask)
+            frames = tuple(frames)
 
             # Encode the heading as cos(theta) and sin(theta) frames matching image dimensions,
             # so the mapping between panorama and weather heading can be learned
-            _, H, W = F.get_dimensions(I0)
+            _, H, W = F.get_dimensions(frames[0])
             cos = torch.cos(torch.linspace(0, 2 * torch.pi, W).unsqueeze(0).expand(H, -1))
             sin = torch.sin(torch.linspace(0, 2 * torch.pi, W).unsqueeze(0).expand(H, -1))
             angle_mask = torch.stack([cos, sin, torch.zeros_like(sin)], dim=0)
@@ -455,10 +560,13 @@ class Photocast2DDatasetZarr(Dataset):
             angle_mask = F.to_image(torch.roll(angle_mask, int(W / 2)))
 
         if self.img_transform is not None:
-            assert all(isinstance(I, tv_tensors.Image) for I in (I0, It, It_prev, view_mask, angle_mask))
-            I0, It, It_prev, view_mask, angle_mask = self.img_transform(I0, It, It_prev, view_mask, angle_mask)
+            assert all(isinstance(I, tv_tensors.Image) for I in (*frames, view_mask, angle_mask))
+            # one call, so random crops are the same for every frame and mask
+            *frames, view_mask, angle_mask = self.img_transform(*frames, view_mask, angle_mask)
             # Drop redundant dimensions
             view_mask = F.rgb_to_grayscale(view_mask)
+
+        I0, It, It_prev = frames[:3]
 
         if self.w_transform:
             w0 = normalize_weather(w0, self.std_scaler)
@@ -469,6 +577,9 @@ class Photocast2DDatasetZarr(Dataset):
         sample["tensors"] = (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask)
         sample["view"] = self.cam
         sample["datetimes"] = [dt.strftime('%Y-%m-%d_%H:%M') for dt in times]
+        if self.reference is not None:
+            sample["reference"] = (frames[3], ref_age)
+            sample["reference_time"] = ref_time
 
         return sample
 
@@ -508,6 +619,13 @@ def native_size_from_cfg(cfg):
     """(height, width multiple) of native field of view panoramas"""
     return (cfg['data']['img_size'][0], cfg['data'].get('width_multiple', 32))
 
+def reference_from_cfg(cfg):
+    """Clear-sky reference settings (data.reference in the config), None when absent or not enabled"""
+    reference = cfg["data"].get("reference")
+    if not reference or not reference.get("enabled", True):
+        return None
+    return reference
+
 def camera_csv_path(cfg, camera):
     return os.path.join(cfg['data']['image_root_dir'], "images", "2026-09-24_train_cams", f"{camera}.csv")
 
@@ -515,7 +633,8 @@ def get_photocast_dataloader(cfg):
     """
     Training dataset over all cameras in cfg["data"]["train"], with the weather zarr store opened once
     and shared by every camera. Samples are dicts with
-    "tensors": (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask).
+    "tensors": (I0, It, It_prev, w0, wt, wt_prev, angle_mask, view_mask), and with data.reference enabled
+    "reference": (Iref, ref_age).
     With train_crop "native", every camera has its own width and dataset.widths holds the width of every sample
     (batch them with util.sampler.WidthBinBatchSampler).
     """
@@ -525,6 +644,8 @@ def get_photocast_dataloader(cfg):
     train_crop = cfg["data"].get("train_crop", "random")
     transforms = get_photocast_transforms(cfg, crop=train_crop)
     native_size = native_size_from_cfg(cfg) if train_crop == "native" else None
+
+    reference = reference_from_cfg(cfg)
 
     shared_weather = xr.open_zarr(os.path.join(cfg["data"]["weather_root_dir"], "inca.zarr"), consolidated=True, chunks=None)
 
@@ -543,7 +664,8 @@ def get_photocast_dataloader(cfg):
                                        img_transform=transforms,
                                        lead_times=cfg["data"]["lead_times"],
                                        date_ranges=cfg["data"].get("date_ranges"),
-                                       native_size=native_size)
+                                       native_size=native_size,
+                                       reference=reference)
             )
             cameras.append(camera)
         except IndexError as e:
@@ -555,6 +677,11 @@ def get_photocast_dataloader(cfg):
     dataset.widths = np.concatenate([np.full(len(d), d.width) for d in datasets]) if native_size is not None else None
     print(f"Loaded {len(cameras)}/{len(cfg['data']['train'])} cameras, {len(dataset)} samples")
     for camera, d in zip(cameras, datasets):
-        print(f"  {camera}  {len(d)} samples ({len(d.data)} images)" + (f", width {d.width}" if d.width else ""))
+        print(f"  {camera}  {len(d)} samples ({len(d.data)} images)" + (f", width {d.width}" if d.width else "")
+              + (f", reference for {100 * d.ref_fraction:.0f}%" if reference is not None else ""))
+    if reference is not None:
+        n_ref = sum(d.ref_fraction * len(d) for d in datasets)
+        print(f"Reference frames for {100 * n_ref / max(len(dataset), 1):.1f}% of the samples "
+              f"(max age {reference.get('max_age_days', 14)} days, +-{reference.get('tod_window_min', 60)} min)")
 
     return dataset
