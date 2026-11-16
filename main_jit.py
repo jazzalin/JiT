@@ -145,7 +145,7 @@ def get_args_parser():
     # Weights & Biases logging (main process only)
     parser.add_argument('--no_wandb', action='store_true', help='Disable W&B logging')
     parser.add_argument('--wandb_project', default='photocast-jit', type=str)
-    parser.add_argument('--wandb_entity', default=None, type=str, help='W&B team or user (default: your default entity)')
+    parser.add_argument('--wandb_entity', default='glaidos', type=str, help='W&B team or user (default: your default entity)')
     parser.add_argument('--wandb_name', default=None, type=str, help='Run name (default: the output folder name)')
     parser.add_argument('--wandb_mode', default='online', choices=['online', 'offline'],
                         help='offline: log to <output_dir>/wandb only (e.g. compute nodes without internet), '
